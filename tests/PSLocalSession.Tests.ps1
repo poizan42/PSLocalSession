@@ -155,6 +155,45 @@ Describe 'Current-user session' {
     }
 }
 
+Describe 'Windows PowerShell 5.1 target' -Tag 'PowerShell51' {
+    It 'connects through the default IPC pipe' {
+        $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $powershell)) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 is not installed'
+            return
+        }
+
+        $session = $null
+        $targetPid = 0
+        try {
+            $session = New-LocalPSSession -CurrentUser -NoProfile `
+                -PowerShellPath $powershell -StartupTimeoutSeconds 60
+            $targetPid = [int]$session.LocalPSSessionProcessId
+
+            $session.LocalPSSessionConnectionMode | Should -Be 'Default'
+            $session.LocalPSSessionPipeName | Should -Be '<default IPC pipe>'
+
+            $info = Invoke-Command -Session $session -ScriptBlock {
+                [pscustomobject]@{
+                    Edition = $PSVersionTable.PSEdition
+                    Version = $PSVersionTable.PSVersion.ToString()
+                    Pid     = $PID
+                }
+            }
+            $info.Edition | Should -Be 'Desktop'
+            $info.Version | Should -Match '^5\.1\.'
+            $info.Pid | Should -Be $targetPid
+        }
+        finally {
+            if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+            if ($targetPid) {
+                [void](Wait-PSLocalSessionProcessExit -ProcessId $targetPid)
+                Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 Describe 'Concurrent sessions' {
     It 'keeps unrelated sessions alive when one is removed' {
         $one = $null
@@ -213,8 +252,9 @@ Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
             $pipe = 'PSLocalSession.{0}' -f [guid]::NewGuid().ToString('N')
             $controlName = 'PSLocalSession.Ctl.{0}' -f [guid]::NewGuid().ToString('N')
             $bootstrap = New-PSLocalSessionBootstrapScript -PipeName $pipe `
-                -ControlPipeName $controlName -CallerSid $caller.User.Value -ConnectTimeoutSeconds 60
-            $encoded = ConvertTo-PSLocalSessionEncodedCommand -Script $bootstrap
+                -ControlPipeName $controlName -CallerSid $caller.User.Value `
+                -ConnectTimeoutSeconds 60 -CallerIsDesktop $false -TargetIsDesktop $false
+            $taskCommand = ConvertTo-PSLocalSessionCompressedBootstrapCommand -Script $bootstrap
 
             $control = New-PSLocalSessionControlPipe -PipeName $controlName `
                 -CallerSid $caller.User -TargetSid $target.Sid
@@ -224,7 +264,7 @@ Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
             $targetPid = 0
             try {
                 $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwsh `
-                    -EncodedCommand $encoded -TargetUserName $target.UserName `
+                    -BootstrapCommand $taskCommand -TargetUserName $target.UserName `
                     -InteractiveToken -NoProfile
                 $task.Registered | Should -BeTrue
 

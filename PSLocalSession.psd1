@@ -5,8 +5,8 @@
     Author               = 'PSLocalSession'
     Copyright            = '(c) PSLocalSession. All rights reserved.'
     Description          = 'Starts PowerShell as another local user and returns a PSSession connected over a local named pipe.'
-    PowerShellVersion    = '7.1'
-    CompatiblePSEditions = @('Core')
+    PowerShellVersion    = '5.1'
+    CompatiblePSEditions = @('Desktop', 'Core')
     FunctionsToExport    = @('New-LocalPSSession')
     CmdletsToExport      = @()
     VariablesToExport    = @()

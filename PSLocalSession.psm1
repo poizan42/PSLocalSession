@@ -1,4 +1,4 @@
-#Requires -Version 7.1
+#Requires -Version 5.1
 
 Set-StrictMode -Version Latest
 
@@ -43,6 +43,12 @@ namespace PSLocalSession.Server
             "IsDisposed", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly MethodInfo StartListeningMethod = ServerType.GetMethod(
             "StartListening", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo IpcServerEnabledField = ServerType.GetField(
+            "IPCNamedPipeServerEnabled", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly FieldInfo IpcServerField = ServerType.GetField(
+            "IPCNamedPipeServer", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo PipeNameProperty = ServerType.GetProperty(
+            "PipeName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly Type MediatorType = ServerType.Assembly.GetType(
             "System.Management.Automation.Remoting.Server.NamedPipeProcessMediator");
         private static readonly MethodInfo RunMethod = MediatorType == null ? null : MediatorType.GetMethod(
@@ -109,6 +115,29 @@ namespace PSLocalSession.Server
             }
         }
 
+        public static RemoteSessionNamedPipeServer StartDefault(PipeSecurity security)
+        {
+            EnsureAvailable();
+            if (security == null) { throw new ArgumentNullException("security"); }
+            if (IpcServerEnabledField == null || IpcServerField == null || PipeNameProperty == null)
+            {
+                throw new InvalidOperationException("The default IPC server fields are not available.");
+            }
+
+            IpcServerEnabledField.SetValue(null, false);
+            var defaultServer = (RemoteSessionNamedPipeServer)IpcServerField.GetValue(null);
+            if (defaultServer == null)
+            {
+                throw new InvalidOperationException("The default IPC server is not running.");
+            }
+
+            string pipeName = (string)PipeNameProperty.GetValue(defaultServer, null);
+            defaultServer.Dispose();
+
+            // The caller retries if the old instance has not disappeared yet.
+            return Start(pipeName, security);
+        }
+
         public static bool IsDisposed(RemoteSessionNamedPipeServer server)
         {
             try
@@ -138,6 +167,220 @@ namespace PSLocalSession.Server
 '@
 
 $script:CSharpBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script:CSharpSource))
+
+# Windows PowerShell 5.1 has the same internal PSRP server/client, but
+# RemoteSessionNamedPipeServer is not public and NamedPipeServerStreamAcl does not exist.
+# This reflection-only helper replaces the process's default IPC server with an
+# ACL-adjusted clone using the default AppDomain pipe name. That is the only 5.1 path
+# that completes the PSRP handshake; custom pipe names did not.
+$script:CSharpSource51 = @'
+using System;
+using System.IO;
+using System.IO.Pipes;
+using System.Reflection;
+using System.Threading;
+
+namespace PSLocalSession.Server
+{
+    public static class PipeServer
+    {
+        private const BindingFlags Flags =
+            BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+
+        private static readonly Type ServerType = typeof(System.Management.Automation.PSObject).Assembly.GetType(
+            "System.Management.Automation.Remoting.RemoteSessionNamedPipeServer");
+
+        private static void EnsureAvailable()
+        {
+            if (ServerType == null)
+            {
+                throw new InvalidOperationException("RemoteSessionNamedPipeServer is not available.");
+            }
+        }
+
+        public static object StartDefault(PipeSecurity security)
+        {
+            EnsureAvailable();
+            if (security == null) { throw new ArgumentNullException("security"); }
+
+            FieldInfo enabledField = ServerType.GetField("IPCNamedPipeServerEnabled", Flags);
+            FieldInfo serverField = ServerType.GetField("IPCNamedPipeServer", Flags);
+            PropertyInfo pipeNameProperty = ServerType.GetProperty("PipeName", Flags);
+            MethodInfo disposeMethod = ServerType.GetMethod("Dispose", Flags);
+            if (enabledField == null || serverField == null || pipeNameProperty == null || disposeMethod == null)
+            {
+                throw new InvalidOperationException("The default IPC server fields are not available.");
+            }
+
+            enabledField.SetValue(null, false);
+            object defaultServer = serverField.GetValue(null);
+            if (defaultServer == null)
+            {
+                throw new InvalidOperationException("The default IPC server is not running.");
+            }
+
+            string pipeName = (string)pipeNameProperty.GetValue(defaultServer, null);
+            disposeMethod.Invoke(defaultServer, null);
+
+            ConstructorInfo ctor = ServerType.GetConstructor(
+                Flags, null, new Type[] { typeof(string) }, null);
+            if (ctor == null)
+            {
+                throw new InvalidOperationException("RemoteSessionNamedPipeServer constructor not found.");
+            }
+
+            object server = null;
+            Exception lastError = null;
+            for (int attempt = 0; attempt < 50; attempt++)
+            {
+                try
+                {
+                    server = ctor.Invoke(new object[] { pipeName });
+                    break;
+                }
+                catch (Exception e)
+                {
+                    lastError = e;
+                    Thread.Sleep(50);
+                }
+            }
+            if (server == null)
+            {
+                throw new IOException("Could not create the default server pipe.", lastError);
+            }
+
+            try
+            {
+                PropertyInfo streamProperty = ServerType.GetProperty("Stream", Flags);
+                NamedPipeServerStream oldStream =
+                    (NamedPipeServerStream)streamProperty.GetValue(server, null);
+                oldStream.Dispose();
+
+                NamedPipeServerStream stream = null;
+                for (int attempt = 0; attempt < 50; attempt++)
+                {
+                    try
+                    {
+                        stream = new NamedPipeServerStream(
+                            pipeName,
+                            PipeDirection.InOut,
+                            1,
+                            PipeTransmissionMode.Message,
+                            PipeOptions.Asynchronous,
+                            32768,
+                            32768,
+                            security);
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        lastError = e;
+                        Thread.Sleep(50);
+                    }
+                }
+                if (stream == null)
+                {
+                    throw new IOException("Could not create the default server pipe.", lastError);
+                }
+
+                FieldInfo streamField = ServerType.GetField("_serverPipeStream", Flags);
+                if (streamField == null)
+                {
+                    streamField = ServerType.GetField("<Stream>k__BackingField", Flags);
+                }
+                if (streamField == null)
+                {
+                    throw new InvalidOperationException("The server stream field was not found.");
+                }
+                streamField.SetValue(server, stream);
+
+                StartListening(server);
+                return server;
+            }
+            catch
+            {
+                try { disposeMethod.Invoke(server, null); } catch { }
+                throw;
+            }
+        }
+
+        private static void StartListening(object server)
+        {
+            Type mediatorType = ServerType.Assembly.GetType(
+                "System.Management.Automation.Remoting.Server.NamedPipeProcessMediator");
+            if (mediatorType == null)
+            {
+                throw new InvalidOperationException("NamedPipeProcessMediator is not available.");
+            }
+
+            MethodInfo runMethod = mediatorType.GetMethod(
+                "Run", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (runMethod == null)
+            {
+                throw new InvalidOperationException("NamedPipeProcessMediator.Run is not available.");
+            }
+
+            Type actionType = typeof(Action<,>).MakeGenericType(
+                new Type[] { typeof(string), ServerType });
+            Delegate run = Delegate.CreateDelegate(actionType, runMethod);
+
+            MethodInfo makeCallback = typeof(PipeServer).GetMethod(
+                "MakeCallback", BindingFlags.Static | BindingFlags.NonPublic);
+            if (makeCallback == null)
+            {
+                throw new InvalidOperationException("The callback factory was not found.");
+            }
+            makeCallback = makeCallback.MakeGenericMethod(new Type[] { ServerType });
+            Delegate callback = (Delegate)makeCallback.Invoke(null, new object[] { run });
+
+            MethodInfo startListening = ServerType.GetMethod("StartListening", Flags);
+            if (startListening == null)
+            {
+                throw new InvalidOperationException("StartListening was not found.");
+            }
+            startListening.Invoke(server, new object[] { callback });
+        }
+
+        private static Action<T> MakeCallback<T>(Delegate run)
+        {
+            return delegate(T server)
+            {
+                run.DynamicInvoke(new object[] { string.Empty, server });
+            };
+        }
+
+        public static bool IsDisposed(object server)
+        {
+            try
+            {
+                PropertyInfo property = ServerType.GetProperty("IsDisposed", Flags);
+                return (bool)property.GetValue(server, null);
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        public static bool IsConnected(object server)
+        {
+            try
+            {
+                PropertyInfo property = ServerType.GetProperty("Stream", Flags);
+                NamedPipeServerStream stream =
+                    (NamedPipeServerStream)property.GetValue(server, null);
+                return stream != null && stream.IsConnected;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+}
+'@
+
+$script:CSharp51Base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script:CSharpSource51))
 
 
 #region General helpers
@@ -192,7 +435,7 @@ function Resolve-PSLocalSessionUser {
 }
 
 function Get-PSLocalSessionPowerShellPath {
-    <# .SYNOPSIS Locates the pwsh.exe used to host the target session. #>
+    <# .SYNOPSIS Locates the PowerShell executable used to host the target session. #>
     [OutputType([string])]
     [CmdletBinding()]
     param([string]$Path)
@@ -209,12 +452,78 @@ function Get-PSLocalSessionPowerShellPath {
         throw 'Cannot determine $PSHOME for the current PowerShell host.'
     }
 
-    $candidate = [System.IO.Path]::Combine($PSHOME, 'pwsh.exe')
+    $executable = if ($PSVersionTable.PSEdition -eq 'Desktop') { 'powershell.exe' } else { 'pwsh.exe' }
+    $candidate = [System.IO.Path]::Combine($PSHOME, $executable)
     if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-        throw ("Cannot find pwsh.exe at '{0}'. Use -PowerShellPath to point at a shared " +
-               "PowerShell 7.1+ installation the target account can read." -f $candidate)
+        throw ("Cannot find {0} at '{1}'. Use -PowerShellPath to point at a shared " +
+               "PowerShell 5.1 or 7.1+ installation the target account can read." -f
+               $executable, $candidate)
     }
     return $candidate
+}
+
+function Get-PSLocalSessionTargetInfo {
+    <#  .SYNOPSIS Identifies the target executable's edition/version before launch.
+
+        The target may be Windows PowerShell 5.1 or PowerShell 7.1+. The caller uses this
+        to select the correct self-contained C# helper for the bootstrap and keep the
+        scheduled-task command line under the Task Scheduler limit. #>
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PowerShellPath
+    )
+
+    $command = '$PSVersionTable.PSEdition + "|" + $PSVersionTable.PSVersion.ToString()'
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $PowerShellPath
+    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $command)
+    if ([System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-PSLocalSessionCommandLine -ArgumentList $arguments
+    }
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = [System.IO.Path]::Combine($env:SystemRoot, 'System32')
+
+    $process = $null
+    try {
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        $output = $process.StandardOutput.ReadToEnd()
+        $errorText = $process.StandardError.ReadToEnd()
+        if (-not $process.WaitForExit(15000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw 'The target PowerShell did not report its version within 15 seconds.'
+        }
+        if ($process.ExitCode -ne 0) {
+            throw ("Exit code {0}: {1}" -f $process.ExitCode, $errorText.Trim())
+        }
+    }
+    catch {
+        throw ("Could not query the target PowerShell at '{0}': {1}" -f
+            $PowerShellPath, $_.Exception.Message)
+    }
+    finally {
+        if ($process) { $process.Dispose() }
+    }
+
+    $line = @($output -split "`r?`n" | Where-Object { $_ -match '^(Core|Desktop)\|' } | Select-Object -Last 1)
+    if (-not $line) {
+        throw ("The target PowerShell at '{0}' did not report its edition and version." -f
+            $PowerShellPath)
+    }
+
+    $parts = $line -split '\|', 2
+    return [pscustomobject]@{
+        PSEdition = $parts[0]
+        Version   = [version]$parts[1]
+    }
 }
 
 function ConvertTo-PSLocalSessionCommandLineArgument {
@@ -267,16 +576,35 @@ function ConvertTo-PSLocalSessionCommandLine {
     }) -join ' ')
 }
 
-function ConvertTo-PSLocalSessionEncodedCommand {
-    <# .SYNOPSIS Encodes a script for pwsh -EncodedCommand. #>
+function ConvertTo-PSLocalSessionCompressedBootstrapCommand {
+    <#  .SYNOPSIS Builds a short -Command argument containing a gzip-compressed bootstrap.
+
+        Task Scheduler rejects long action arguments; the raw bootstrap (especially the
+        embedded C# helper) can exceed that limit. The target decodes this with the in-box
+        .NET compression classes before invoking the real bootstrap. #>
     [OutputType([string])]
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Script
+        [Parameter(Mandatory)][string]$Script
     )
 
-    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Script)
+    $memory = [IO.MemoryStream]::new()
+    $gzip = [IO.Compression.GZipStream]::new(
+        $memory, [IO.Compression.CompressionMode]::Compress, $true)
+    try {
+        $gzip.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $gzip.Dispose()
+    }
+    $base64 = [Convert]::ToBase64String($memory.ToArray())
+    $memory.Dispose()
+
+    $decoder = @'
+$b='{0}';$m=[IO.MemoryStream]::new([Convert]::FromBase64String($b));$g=[IO.Compression.GZipStream]::new($m,[IO.Compression.CompressionMode]::Decompress);$r=[IO.StreamReader]::new($g,[Text.Encoding]::UTF8);$s=$r.ReadToEnd();$r.Dispose();$g.Dispose();$m.Dispose();[ScriptBlock]::Create($s).Invoke()
+'@
+    return ($decoder -f $base64)
 }
 
 function New-PSLocalSessionControlPipe {
@@ -301,6 +629,19 @@ function New-PSLocalSessionControlPipe {
             [System.Security.AccessControl.AccessControlType]::Allow))
     }
 
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        # .NET Framework has the PipeSecurity constructor directly.
+        return [System.IO.Pipes.NamedPipeServerStream]::new(
+            $PipeName,
+            [System.IO.Pipes.PipeDirection]::InOut,
+            1,
+            [System.IO.Pipes.PipeTransmissionMode]::Byte,
+            [System.IO.Pipes.PipeOptions]::Asynchronous,
+            4096,
+            4096,
+            $security)
+    }
+
     return [System.IO.Pipes.NamedPipeServerStreamAcl]::Create(
         $PipeName,
         [System.IO.Pipes.PipeDirection]::InOut,
@@ -320,7 +661,9 @@ function New-PSLocalSessionBootstrapScript {
         [Parameter(Mandatory)][string]$PipeName,
         [Parameter(Mandatory)][string]$ControlPipeName,
         [Parameter(Mandatory)][string]$CallerSid,
-        [Parameter(Mandatory)][int]$ConnectTimeoutSeconds
+        [Parameter(Mandatory)][int]$ConnectTimeoutSeconds,
+        [Parameter(Mandatory)][bool]$CallerIsDesktop,
+        [Parameter(Mandatory)][bool]$TargetIsDesktop
     )
 
     $template = @'
@@ -329,6 +672,7 @@ $pipeName = '__PIPE__'
 $controlPipe = '__CONTROL__'
 $callerSid = '__CALLER_SID__'
 $connectTimeoutSeconds = __CONNECT_TIMEOUT__
+$callerIsDesktop = __CALLER_IS_DESKTOP__
 
 function Send-StartupMessage {
     param([string]$Text)
@@ -353,32 +697,44 @@ function Send-StartupMessage {
 }
 
 try {
-    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
-        throw ('The target PowerShell must be PowerShell 7.1 or later. ' +
-               'Windows PowerShell 5.1 is not supported yet.')
+    $isDesktopTarget = $PSVersionTable.PSEdition -eq 'Desktop'
+    if ($isDesktopTarget) {
+        if ($PSVersionTable.PSVersion -lt [version]'5.1') {
+            throw 'The target PowerShell must be Windows PowerShell 5.1 or later.'
+        }
     }
-    if (-not $IsWindows) {
-        throw 'The target PowerShell must be running on Windows.'
+    else {
+        if ($PSVersionTable.PSVersion -lt [version]'7.1') {
+            throw 'The target PowerShell must be PowerShell 7.1 or later.'
+        }
+        if (-not $IsWindows) {
+            throw 'The target PowerShell must be running on Windows.'
+        }
     }
 
     $csharp = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CS_B64__'))
-    if ($PSVersionTable.PSVersion -lt [version]'7.2') {
-        # In 7.1 the pipes ACL types are type-forwarded and Add-Type needs the
-        # implementations explicitly.
-        $referenceAssemblies = @([System.Management.Automation.PSObject].Assembly.Location)
-        foreach ($assemblyName in 'System.IO.Pipes.dll',
-                                  'System.IO.Pipes.AccessControl.dll',
-                                  'System.Security.AccessControl.dll') {
-            $assemblyPath = Join-Path $PSHOME $assemblyName
-            if (Test-Path -LiteralPath $assemblyPath) {
-                $referenceAssemblies += $assemblyPath
-            }
-        }
-        Add-Type -TypeDefinition $csharp -Language CSharp `
-            -ReferencedAssemblies $referenceAssemblies -ErrorAction Stop
+    if ($isDesktopTarget) {
+        Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
     }
     else {
-        Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
+        if ($PSVersionTable.PSVersion -lt [version]'7.2') {
+            # In 7.1 the pipes ACL types are type-forwarded and Add-Type needs the
+            # implementations explicitly.
+            $referenceAssemblies = @([System.Management.Automation.PSObject].Assembly.Location)
+            foreach ($assemblyName in 'System.IO.Pipes.dll',
+                                      'System.IO.Pipes.AccessControl.dll',
+                                      'System.Security.AccessControl.dll') {
+                $assemblyPath = Join-Path $PSHOME $assemblyName
+                if (Test-Path -LiteralPath $assemblyPath) {
+                    $referenceAssemblies += $assemblyPath
+                }
+            }
+            Add-Type -TypeDefinition $csharp -Language CSharp `
+                -ReferencedAssemblies $referenceAssemblies -ErrorAction Stop
+        }
+        else {
+            Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
+        }
     }
 
     $security = [System.IO.Pipes.PipeSecurity]::new()
@@ -396,8 +752,29 @@ try {
             [System.Security.AccessControl.AccessControlType]::Allow))
     }
 
-    $server = [PSLocalSession.Server.PipeServer]::Start($pipeName, $security)
-    Send-StartupMessage ('OK {0}' -f $PID)
+    if ($isDesktopTarget -or $callerIsDesktop -eq 1) {
+        # A 5.1 caller cannot use NamedPipeConnectionInfo(string), and a 5.1 target
+        # only completed the handshake on its default AppDomain pipe. Use a clone of
+        # the default IPC server with the caller/target DACL in either case.
+        $server = $null
+        $lastError = $null
+        for ($attempt = 0; $attempt -lt 50 -and -not $server; $attempt++) {
+            try {
+                $server = [PSLocalSession.Server.PipeServer]::StartDefault($security)
+            }
+            catch {
+                $lastError = $_
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        if (-not $server) { throw $lastError }
+        $connectionMode = 'Default'
+    }
+    else {
+        $server = [PSLocalSession.Server.PipeServer]::Start($pipeName, $security)
+        $connectionMode = 'Custom'
+    }
+    Send-StartupMessage ('OK {0} {1}' -f $PID, $connectionMode)
 
     $deadline = [DateTime]::UtcNow.AddSeconds($connectTimeoutSeconds)
     while (-not [PSLocalSession.Server.PipeServer]::IsConnected($server) -and
@@ -426,11 +803,17 @@ catch {
 '@
 
     return $template.
-        Replace('__CS_B64__', $script:CSharpBase64).
+        Replace('__CS_B64__', $(if ($TargetIsDesktop) {
+            $script:CSharp51Base64
+        }
+        else {
+            $script:CSharpBase64
+        })).
         Replace('__PIPE__', $PipeName).
         Replace('__CONTROL__', $ControlPipeName).
         Replace('__CALLER_SID__', $CallerSid).
-        Replace('__CONNECT_TIMEOUT__', [string]$ConnectTimeoutSeconds)
+        Replace('__CONNECT_TIMEOUT__', [string]$ConnectTimeoutSeconds).
+        Replace('__CALLER_IS_DESKTOP__', $(if ($CallerIsDesktop) { '1' } else { '0' }))
 }
 
 #endregion
@@ -518,10 +901,10 @@ function Get-PSLocalSessionTaskResultHint {
 #region Launching the target
 
 function Start-PSLocalSessionProcess {
-    <#  .SYNOPSIS Starts pwsh.exe directly, optionally as another user via
-        CreateProcessWithLogonW.
+    <#  .SYNOPSIS Starts the target PowerShell executable directly, optionally as
+        another user via CreateProcessWithLogonW.
 
-        The bootstrap is delivered on standard input: pwsh runs a short command that
+        The bootstrap is delivered on standard input: the target runs a short command that
         reads all of stdin and invokes it as a script block. CreateProcessWithLogonW
         documents a 1024-character command line limit, and the self-contained bootstrap
         is much longer than that. Standard input has no such limit and needs no shared
@@ -537,11 +920,20 @@ function Start-PSLocalSessionProcess {
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $PowerShellPath
-    [void]$startInfo.ArgumentList.Add('-NoLogo')
-    [void]$startInfo.ArgumentList.Add('-NonInteractive')
-    if ($NoProfile) { [void]$startInfo.ArgumentList.Add('-NoProfile') }
-    [void]$startInfo.ArgumentList.Add('-Command')
-    [void]$startInfo.ArgumentList.Add('[ScriptBlock]::Create([Console]::In.ReadToEnd()).Invoke()')
+    $arguments = [System.Collections.Generic.List[string]]::new()
+    $arguments.Add('-NoLogo')
+    $arguments.Add('-NonInteractive')
+    if ($NoProfile) { $arguments.Add('-NoProfile') }
+    $arguments.Add('-Command')
+    $arguments.Add('[ScriptBlock]::Create([Console]::In.ReadToEnd()).Invoke()')
+    if ([System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
+        foreach ($argument in $arguments) {
+            [void]$startInfo.ArgumentList.Add($argument)
+        }
+    }
+    else {
+        $startInfo.Arguments = ConvertTo-PSLocalSessionCommandLine -ArgumentList $arguments.ToArray()
+    }
 
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
@@ -623,7 +1015,7 @@ function Remove-OrphanedPSLocalSessionTask {
 }
 
 function Start-PSLocalSessionScheduledTask {
-    <#  .SYNOPSIS Starts pwsh.exe through Task Scheduler.
+    <#  .SYNOPSIS Starts the target PowerShell through Task Scheduler.
 
         The production path uses a stored password and therefore a BATCH logon. The
         -InteractiveToken switch exists so tests can exercise the task plumbing without a
@@ -633,7 +1025,7 @@ function Start-PSLocalSessionScheduledTask {
     [CmdletBinding(DefaultParameterSetName = 'Password')]
     param(
         [Parameter(Mandatory)][string]$PowerShellPath,
-        [Parameter(Mandatory)][string]$EncodedCommand,
+        [Parameter(Mandatory)][string]$BootstrapCommand,
         [Parameter(Mandatory, ParameterSetName = 'Password')][pscredential]$Credential,
         [Parameter(Mandatory)][string]$TargetUserName,
         [Parameter(Mandatory, ParameterSetName = 'Interactive')][switch]$InteractiveToken,
@@ -651,8 +1043,8 @@ function Start-PSLocalSessionScheduledTask {
     $arguments.Add('-NoLogo')
     $arguments.Add('-NonInteractive')
     if ($NoProfile) { $arguments.Add('-NoProfile') }
-    $arguments.Add('-EncodedCommand')
-    $arguments.Add($EncodedCommand)
+    $arguments.Add('-Command')
+    $arguments.Add($BootstrapCommand)
     $argumentLine = ConvertTo-PSLocalSessionCommandLine -ArgumentList $arguments.ToArray()
 
     $action = New-ScheduledTaskAction -Execute $PowerShellPath -Argument $argumentLine `
@@ -831,8 +1223,12 @@ function Wait-PSLocalSessionControlMessage {
         throw 'The target PowerShell process closed the startup pipe without reporting readiness.'
     }
 
-    if ($line -match '^OK (?<pid>\d+)$') {
-        return [pscustomobject]@{ ProcessId = [int]$Matches['pid'] }
+    if ($line -match '^OK (?<pid>\d+)(?: (?<mode>Custom|Default))?$') {
+        $connectionMode = if ($Matches['mode']) { $Matches['mode'] } else { 'Custom' }
+        return [pscustomobject]@{
+            ProcessId      = [int]$Matches['pid']
+            ConnectionMode = $connectionMode
+        }
     }
     if ($line -match '^ERROR (?<message>.*)$') {
         throw "The target PowerShell process could not start the session: $($Matches['message'])"
@@ -912,16 +1308,17 @@ function New-LocalPSSession {
         Starts a PowerShell process as another local user and returns a PSSession to it.
 
     .DESCRIPTION
-        New-LocalPSSession is a "su" for PowerShell. It launches pwsh.exe under the
-        requested account, exposes a local named pipe with an ACL for only that account
-        and the caller, connects with NamedPipeConnectionInfo, and wraps the resulting
-        remote runspace in a normal PSSession.
+        New-LocalPSSession is a "su" for PowerShell. It launches a Windows PowerShell 5.1
+        or PowerShell 7.1+ target under the requested account, exposes a local named pipe
+        with an ACL for only that account and the caller, connects with
+        NamedPipeConnectionInfo, and wraps the resulting remote runspace in a normal
+        PSSession.
 
         The session process exits automatically when the PSSession is removed or the
         calling PowerShell process goes away.
 
         The launch method is selected automatically:
-          - -CurrentUser      starts pwsh.exe directly.
+          - -CurrentUser      starts the target PowerShell directly.
           - elevated caller   uses a temporary scheduled task (batch logon).
           - non-elevated      uses CreateProcessWithLogonW (interactive logon).
 
@@ -938,8 +1335,10 @@ function New-LocalPSSession {
         Starts the target PowerShell with -NoProfile.
 
     .PARAMETER PowerShellPath
-        The pwsh.exe to run. Defaults to the current installation ($PSHOME\pwsh.exe).
-        The target account must be able to read and execute this file.
+        The target executable to run. Defaults to the current installation
+        ($PSHOME\pwsh.exe on 7.1+, $PSHOME\powershell.exe on 5.1). The target account must
+        be able to read and execute this file. The target edition may differ from the
+        caller's edition.
 
     .PARAMETER StartupTimeoutSeconds
         How long to wait for the target process to start listening. Defaults to 30.
@@ -981,12 +1380,19 @@ function New-LocalPSSession {
         [int]$StartupTimeoutSeconds = 30
     )
 
-    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
-        throw ('New-LocalPSSession requires PowerShell 7.1 or later. ' +
-               'Windows PowerShell 5.1 is not supported yet.')
+    $callerIsDesktop = $PSVersionTable.PSEdition -eq 'Desktop'
+    if ($callerIsDesktop) {
+        if ($PSVersionTable.PSVersion -lt [version]'5.1') {
+            throw 'New-LocalPSSession requires Windows PowerShell 5.1 or later.'
+        }
     }
-    if (-not $IsWindows) {
-        throw 'New-LocalPSSession uses Windows named pipes and Windows logon APIs; it is Windows-only.'
+    else {
+        if ($PSVersionTable.PSVersion -lt [version]'7.1') {
+            throw 'New-LocalPSSession requires PowerShell 7.1 or later.'
+        }
+        if (-not $IsWindows) {
+            throw 'New-LocalPSSession uses Windows named pipes and Windows logon APIs; it is Windows-only.'
+        }
     }
 
     $callerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1015,14 +1421,26 @@ function New-LocalPSSession {
         $target.UserName, $target.Sid.Value, $launchMethod)
 
     $pwshPath = Get-PSLocalSessionPowerShellPath -Path $PowerShellPath
+    $targetInfo = Get-PSLocalSessionTargetInfo -PowerShellPath $pwshPath
+    $targetIsDesktop = $targetInfo.PSEdition -eq 'Desktop'
+    if ($targetIsDesktop) {
+        if ($targetInfo.Version -lt [version]'5.1') {
+            throw 'The target PowerShell must be Windows PowerShell 5.1 or later.'
+        }
+    }
+    elseif ($targetInfo.Version -lt [version]'7.1') {
+        throw 'The target PowerShell must be PowerShell 7.1 or later.'
+    }
+
     $pipeName = 'PSLocalSession.{0}' -f [guid]::NewGuid().ToString('N')
     $controlPipeName = 'PSLocalSession.Ctl.{0}' -f [guid]::NewGuid().ToString('N')
     $connectTimeoutSeconds = [Math]::Max($script:BootstrapConnectTimeoutSeconds, $StartupTimeoutSeconds + 30)
 
     $bootstrap = New-PSLocalSessionBootstrapScript -PipeName $pipeName `
         -ControlPipeName $controlPipeName -CallerSid $callerSid.Value `
-        -ConnectTimeoutSeconds $connectTimeoutSeconds
-    $encodedCommand = ConvertTo-PSLocalSessionEncodedCommand -Script $bootstrap
+        -ConnectTimeoutSeconds $connectTimeoutSeconds `
+        -CallerIsDesktop $callerIsDesktop -TargetIsDesktop $targetIsDesktop
+    $taskCommand = ConvertTo-PSLocalSessionCompressedBootstrapCommand -Script $bootstrap
 
     $controlPipe = $null
     $connectionTask = $null
@@ -1041,7 +1459,7 @@ function New-LocalPSSession {
 
         if ($launchMethod -eq 'ScheduledTask') {
             $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwshPath `
-                -EncodedCommand $encodedCommand -Credential $Credential `
+                -BootstrapCommand $taskCommand -Credential $Credential `
                 -TargetUserName $target.UserName -NoProfile:$NoProfile
 
             $taskName = $task.TaskName
@@ -1054,7 +1472,7 @@ function New-LocalPSSession {
                 if ($hint) { $text += " -- $hint" }
                 if ($info.LastRunTime) { $text += " (last run $($info.LastRunTime))" }
                 return $text
-            }.GetNewClosure()
+            }
 
             $checkFailure = {
                 $scheduledTask = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue
@@ -1077,7 +1495,7 @@ function New-LocalPSSession {
                 $text = "task state $($scheduledTask.State), last result 0x{0:X8}" -f $info.LastTaskResult
                 if ($hint) { $text += " -- $hint" }
                 return $text
-            }.GetNewClosure()
+            }
         }
         else {
             $credentialForProcess = if ($launchMethod -eq 'CreateProcessWithLogon') { $Credential } else { $null }
@@ -1090,7 +1508,7 @@ function New-LocalPSSession {
                     return "Target process exited with code $($targetProcess.ExitCode)."
                 }
                 return "Target process $($targetProcess.Id) is still running but did not report readiness."
-            }.GetNewClosure()
+            }
         }
 
         Write-Verbose 'Waiting for the target PowerShell process to report readiness.'
@@ -1112,7 +1530,16 @@ function New-LocalPSSession {
         $controlPipe.Dispose()
         $controlPipe = $null
 
-        $connectionInfo = [System.Management.Automation.Runspaces.NamedPipeConnectionInfo]::new($pipeName)
+        if ($startup.ConnectionMode -eq 'Default') {
+            # 5.1 has no NamedPipeConnectionInfo(string); both sides use the default
+            # AppDomain pipe name derived from the target PID.
+            $connectionInfo = [System.Management.Automation.Runspaces.NamedPipeConnectionInfo]::new(
+                $targetProcessId)
+        }
+        else {
+            $connectionInfo = [System.Management.Automation.Runspaces.NamedPipeConnectionInfo]::new(
+                $pipeName)
+        }
         $connectionInfo.OpenTimeout = [Math]::Max(5000, $StartupTimeoutSeconds * 1000)
         $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($connectionInfo)
         try {
@@ -1130,12 +1557,20 @@ function New-LocalPSSession {
             -TransportName 'NamedPipe' -Cmdlet $PSCmdlet
         if ($Name) { $session.Name = $Name }
 
+        $sessionPipeName = if ($startup.ConnectionMode -eq 'Custom') {
+            $pipeName
+        }
+        else {
+            '<default IPC pipe>'
+        }
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
             'LocalPSSessionProcessId', $targetProcessId))
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
             'LocalPSSessionUserName', $target.UserName))
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
-            'LocalPSSessionPipeName', $pipeName))
+            'LocalPSSessionPipeName', $sessionPipeName))
+        $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
+            'LocalPSSessionConnectionMode', $startup.ConnectionMode))
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
             'LocalPSSessionLaunchMethod', $launchMethod))
 
