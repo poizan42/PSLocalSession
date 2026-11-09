@@ -61,6 +61,9 @@ interactive logged-on session.
 - On 7.3+, pass `$PSCmdlet` to `PSSession.Create`; that is what registers the session in
   `Get-PSSession`. On 5.1/7.1/7.2 use the internal `PSSession(RemoteRunspace)` constructor
   plus `RunspaceRepository.Add`; do not mix the branches.
+- Create the remote runspace with the caller's `$Host` and a default `TypeTable`, matching
+  `New-PSSession`. Without the type table, `Enter-PSSession` executes commands but silently
+  drops their output.
 - All three pipe DACLs contain only the target account and the caller. Do not broaden them
   to `Everyone`/`Authenticated Users` to work around access failures; fix the SID/ACL.
 - Do **not** replace this with `pwsh -CustomPipeName`, `CreateCustomNamedPipeServer`, or

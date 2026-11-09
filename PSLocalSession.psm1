@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 $script:TaskPath = '\PSLocalSession\'
 $script:BootstrapConnectTimeoutSeconds = 60
 $script:ControlMessageTimeoutMs = 30000
+$script:RunspaceTypeTable = $null
 
 # The target-side bootstrap and C# pipe helpers are separate files next to this
 # module so the target can execute a static script by path and antivirus software can
@@ -1191,7 +1192,13 @@ function New-LocalPSSession {
                 $pipeName)
         }
         $connectionInfo.OpenTimeout = [Math]::Max(5000, $StartupTimeoutSeconds * 1000)
-        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($connectionInfo)
+        # Match New-PSSession's construction: pass the caller host and the current
+        # type table. Enter-PSSession uses them for the nested prompt and output.
+        if (-not $script:RunspaceTypeTable) {
+            $script:RunspaceTypeTable = [System.Management.Automation.Runspaces.TypeTable]::LoadDefaultTypeFiles()
+        }
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace(
+            $connectionInfo, $Host, $script:RunspaceTypeTable)
         try {
             $runspace.Open()
         }

@@ -89,9 +89,9 @@ The returned session also carries diagnostic note properties:
 5. The target writes `OK <pid> Custom` or `OK <pid> Default` (or `ERROR <message>`) to
    the control pipe.
 6. The caller opens the session pipe with `NamedPipeConnectionInfo`: the string constructor
-   for `Custom`, the process-id constructor for `Default`. It wraps the runspace in a
-   `PSSession` using the public `PSSession.Create` on 7.3+, or the internal-constructor
-   fallback on 5.1/7.1/7.2.
+   for `Custom`, the process-id constructor for `Default`. It creates the remote runspace
+   with the caller host and a default type table, then wraps it in a `PSSession` using the
+   public `PSSession.Create` on 7.3+, or the internal-constructor fallback on 5.1/7.1/7.2.
 7. The temporary bootstrap copy is removed. When the `PSSession` is removed, or the
    calling PowerShell process exits, the pipe disconnects and the target process exits by
    itself.
@@ -221,6 +221,9 @@ windows:
 - From an elevated caller, the default `-RunLevel Highest` scheduled-task path was
   exercised against a temporary administrator account. The target reported High integrity
   and `IsInRole(Administrator) = true`; the task and staging copy were removed.
+- Interactive `Enter-PSSession` was exercised in a real console with `-NoProfile` on both
+  sides. Commands such as `whoami` and `Get-Location` produced output after the remote
+  runspace was created with a type table (without it, commands ran but output was dropped).
 - The scheduled-task path was exercised with an interactive-token task (registration,
   static bootstrap-file delivery, unregister-while-running, and disconnect cleanup). The
   stored-password / batch-logon variant shares that plumbing; the password-registration
