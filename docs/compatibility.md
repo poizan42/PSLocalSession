@@ -23,7 +23,7 @@ version.
 | 7.1.7 | **works** | same as 7.3, plus pass `System.IO.Pipes.AccessControl.dll` (and `System.IO.Pipes.dll` / `System.Security.AccessControl.dll`) to `Add-Type -ReferencedAssemblies` |
 | 7.0.13 | **fails** | `NamedPipeServerStreamAcl` does not exist in .NET Core 3.1; needs a portable `CreateNamedPipeW`/P-Invoke pipe-creation path |
 | 6.2.7 | **fails** | same as 7.0; .NET Core 2.1 has no `NamedPipeServerStreamAcl` |
-| Windows PowerShell 5.1 | **fails** | `RemoteSessionNamedPipeServer` and `NamedPipeProcessMediator` are internal (the C# helper would be reflection-only), `NamedPipeServerStreamAcl` does not exist, and `NamedPipeConnectionInfo` has no custom-pipe-name constructor. This needs a separate compatibility layer. |
+| Windows PowerShell 5.1 | **possible; proof of concept works** | replace the process's default IPC server with an ACL-adjusted clone using the **same default pipe name**, then start the internal `NamedPipeProcessMediator`; the caller uses `NamedPipeConnectionInfo(processId)` (default AppDomain). `RemoteSessionNamedPipeServer`/`NamedPipeProcessMediator` are internal, so the helper must be reflection-only. |
 
 ### Caller (the PowerShell session running `New-LocalPSSession`)
 
@@ -33,7 +33,7 @@ version.
 | 7.4 / 7.5 / 7.3 | **works** if the manifest and `#Requires` allow it | all required public APIs are present |
 | 7.2 / 7.1 | **works with a small fallback** | `PSSession.Create(Runspace, string, PSCmdlet)` is public only in 7.3+; use the internal `PSSession(RemoteRunspace)` constructor and add it to `PSCmdlet.RunspaceRepository` via reflection |
 | 7.0 / 6.2 | **needs more work** | no `NamedPipeServerStreamAcl` for the control pipe; needs the same portable named-pipe creation helper; plus the 7.1/7.2 `PSSession` fallback |
-| Windows PowerShell 5.1 | **significant port** | no custom-pipe-name `NamedPipeConnectionInfo` (use the process-id/app-domain form and a matching `PSHost.*` pipe name), no `NamedPipeServerStreamAcl` (use the .NET Framework `NamedPipeServerStream` constructor with `PipeSecurity`), no `PSSession.Create`, no `ProcessStartInfo.ArgumentList`, no `$IsWindows` |
+| Windows PowerShell 5.1 | **possible; compatibility shim required** | use `NamedPipeConnectionInfo(processId)` and the default IPC pipe name; create the control pipe with the .NET Framework `NamedPipeServerStream` + `PipeSecurity` constructor; use the internal `PSSession(RemoteRunspace)` constructor + repository; replace `ProcessStartInfo.ArgumentList` with `Arguments`; use `$PSVersionTable.PSEdition` instead of `$IsWindows` |
 
 The 7.1/7.2 caller fallback was exercised successfully against both a 7.6.9 and a 7.2.24
 target.
@@ -62,6 +62,39 @@ target.
   pipe handle with an unauthorized-operation error; it is not a substitute for creating
   the pipe with the desired DACL.
 
+## Windows PowerShell 5.1: the default IPC server is already a PSRP endpoint
+
+Windows PowerShell 5.1 does have a fully functional named-pipe PSRP **server** and **client**;
+they are just internal. A normal `powershell.exe` process is already listening on
+`PSHost.<starttime>.<pid>.DefaultAppDomain.<processname>` through
+`RemoteSessionNamedPipeServer.IPCNamedPipeServer`.
+
+Proof of concept, run with two Windows PowerShell 5.1 processes:
+
+1. In the target process, reflect `RemoteSessionNamedPipeServer`, set
+   `IPCNamedPipeServerEnabled = false`, and dispose `IPCNamedPipeServer` so the default
+   listener does not immediately recreate itself.
+2. Create a new internal `RemoteSessionNamedPipeServer` with the **same default pipe name**.
+   Replace its `_serverPipeStream` field with a `NamedPipeServerStream` created through the
+   .NET Framework constructor that takes a `PipeSecurity` (this constructor exists in 5.1).
+3. Start the listener with a reflection-created delegate to the internal
+   `NamedPipeProcessMediator.Run(string, RemoteSessionNamedPipeServer)` method.
+4. In a second Windows PowerShell 5.1 process, connect with
+   `[NamedPipeConnectionInfo]::new($targetPid)`, call
+   `RunspaceFactory.CreateRunspace($connectionInfo)`, open it, and run a command.
+
+This worked: the client opened the runspace and executed a command in the server process.
+No custom PSRP/WinRM server was involved; it is the in-box server.
+
+Important detail: the replacement used the **default AppDomain pipe name**. A custom
+AppDomain name / custom pipe name did not complete the PSRP handshake in 5.1, while the
+default name did. That is why the 5.1 path should clone the default IPC server rather than
+invent a new pipe name.
+
+Remaining work for a full 5.1 port is mechanical: caller-side control pipe ACL, the
+`PSSession` fallback, `ProcessStartInfo.Arguments`, `$IsWindows` alternatives, and testing
+the cross-user ACL path.
+
 ## Suggested path if older versions are required
 
 1. **7.4+ target, 7.3+ caller** — the cheapest useful step: relax the guards, no runtime
@@ -71,8 +104,10 @@ target.
 3. **7.0/6.2** — replace `NamedPipeServerStreamAcl` with a portable
    `CreateNamedPipeW`/security-descriptor helper in both the target and the caller control
    pipe.
-4. **Windows PowerShell 5.1** — treat as a separate port; use the process-id/app-domain
-   pipe naming and .NET Framework pipe ACL APIs.
+4. **Windows PowerShell 5.1** — viable without a custom PSRP server: clone/replace the
+   default IPC server with an ACL-adjusted version using the default pipe name, use the
+   process-id connection constructor, and add the caller-side compatibility shim. This is
+   a separate port but not a new remoting stack.
 
 Cross-user behavior on older targets has not been tested; the ACL path is independent of
 the PSRP version, but a second account is needed to validate it.
