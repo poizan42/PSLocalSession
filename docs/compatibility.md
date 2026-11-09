@@ -3,40 +3,38 @@
 ## What the committed module supports
 
 `PSLocalSession.psd1`, the `#Requires` line, the public cmdlet, and the target bootstrap all
-enforce **PowerShell 7.6 or later**. As committed, no older caller or target is supported.
+enforce **PowerShell Core 7.1 or later**, on both the caller and target sides. Windows
+PowerShell 5.1 is intentionally rejected for now.
 
-## Measured behaviour if the version guards are relaxed
+## Measured behaviour
 
 These results were measured on 2026-11-09 with portable release builds on Windows build
-26300. Tests used `-CurrentUser`; cross-user authentication was not repeated for every target
-version.
+26300. Compatibility runs used `-CurrentUser`; cross-user authentication was verified on
+7.6 only.
 
 ### Target `pwsh.exe`
 
-| Target | Result | Required change |
+| Target | Result | Notes |
 |---|---|---|
-| 7.6.9 | **works** | none |
-| 7.5.9 | **works** | remove only the target version guard |
-| 7.4.22 | **works** | remove only the target version guard |
-| 7.3.12 | **works** | remove the target guard; remove `PipeOptions.FirstPipeInstance` and the retry/sleep from the bootstrap C# |
-| 7.2.24 | **works** | same as 7.3 |
-| 7.1.7 | **works** | same as 7.3, plus pass `System.IO.Pipes.AccessControl.dll` (and `System.IO.Pipes.dll` / `System.Security.AccessControl.dll`) to `Add-Type -ReferencedAssemblies` |
-| 7.0.13 | **fails** | `NamedPipeServerStreamAcl` does not exist in .NET Core 3.1; needs a portable `CreateNamedPipeW`/P-Invoke pipe-creation path |
-| 6.2.7 | **fails** | same as 7.0; .NET Core 2.1 has no `NamedPipeServerStreamAcl` |
-| Windows PowerShell 5.1 | **possible; proof of concept works** | replace the process's default IPC server with an ACL-adjusted clone using the **same default pipe name**, then start the internal `NamedPipeProcessMediator`; the caller uses `NamedPipeConnectionInfo(processId)` (default AppDomain). `RemoteSessionNamedPipeServer`/`NamedPipeProcessMediator` are internal, so the helper must be reflection-only. |
+| 7.6.9, 7.5.9, 7.4.22, 7.3.12, 7.2.24, 7.1.7 | **supported** | exercised end to end with a 7.6.9 caller |
+| 7.0.13 | **unsupported** | `NamedPipeServerStreamAcl` does not exist in .NET Core 3.1; would need a portable `CreateNamedPipeW`/P-Invoke pipe-creation path |
+| 6.2.7 | **unsupported** | same as 7.0; .NET Core 2.1 has no `NamedPipeServerStreamAcl` |
+| Windows PowerShell 5.1 | **not implemented** | viable in principle through the default IPC server clone described below, but no 5.1 port exists yet |
+
+The 7.1 target needs the conditional `Add-Type -ReferencedAssemblies` block in the
+bootstrap. From 7.2 onward the default `Add-Type` reference set is sufficient. The
+bootstrap deliberately does not use `PipeOptions.FirstPipeInstance`, which is .NET 8+.
 
 ### Caller (the PowerShell session running `New-LocalPSSession`)
 
-| Caller | Result | Required change |
+| Caller | Result | Notes |
 |---|---|---|
-| 7.6+ | **works** | none |
-| 7.4 / 7.5 / 7.3 | **works** if the manifest and `#Requires` allow it | all required public APIs are present |
-| 7.2 / 7.1 | **works with a small fallback** | `PSSession.Create(Runspace, string, PSCmdlet)` is public only in 7.3+; use the internal `PSSession(RemoteRunspace)` constructor and add it to `PSCmdlet.RunspaceRepository` via reflection |
-| 7.0 / 6.2 | **needs more work** | no `NamedPipeServerStreamAcl` for the control pipe; needs the same portable named-pipe creation helper; plus the 7.1/7.2 `PSSession` fallback |
-| Windows PowerShell 5.1 | **possible; compatibility shim required** | use `NamedPipeConnectionInfo(processId)` and the default IPC pipe name; create the control pipe with the .NET Framework `NamedPipeServerStream` + `PipeSecurity` constructor; use the internal `PSSession(RemoteRunspace)` constructor + repository; replace `ProcessStartInfo.ArgumentList` with `Arguments`; use `$PSVersionTable.PSEdition` instead of `$IsWindows` |
+| 7.6.9, 7.5, 7.4, 7.3 | **supported** | all required public APIs are present |
+| 7.2 / 7.1 | **supported** | the module uses the internal `PSSession(RemoteRunspace)` constructor and adds it to `PSCmdlet.RunspaceRepository` via reflection because public `PSSession.Create` starts in 7.3 |
+| 7.0 / 6.2 | **unsupported** | no `NamedPipeServerStreamAcl` for the control pipe; would need the portable named-pipe creation helper |
+| Windows PowerShell 5.1 | **not implemented** | needs the default-IPC-server path plus caller-side shim described below |
 
-The 7.1/7.2 caller fallback was exercised successfully against both a 7.6.9 and a 7.2.24
-target.
+Caller/target combinations across 7.1.7, 7.2.24, and 7.6.9 were exercised successfully.
 
 ## Relevant API history
 
@@ -55,7 +53,8 @@ target.
   It is absent in 7.0, 6.2, and 5.1. On 7.1 the related types are type-forwarded and
   `Add-Type` needs explicit references to `System.IO.Pipes.AccessControl.dll`.
 - `PipeOptions.FirstPipeInstance` is a .NET **8.0+** API, so it exists in PowerShell
-  **7.4+**. It is absent in 7.1–7.3.
+  **7.4+** but not 7.1–7.3. The bootstrap does not use it; the old pipe is disposed
+  before the replacement is created.
 - `ProcessStartInfo.ArgumentList` exists from .NET Core 2.1 (PowerShell 6.2+), but not in
   Windows PowerShell 5.1.
 - `PipesAclExtensions.SetAccessControl` exists in 6.2/7.0 but fails on an unconnected server
@@ -95,16 +94,14 @@ Remaining work for a full 5.1 port is mechanical: caller-side control pipe ACL, 
 `PSSession` fallback, `ProcessStartInfo.Arguments`, `$IsWindows` alternatives, and testing
 the cross-user ACL path.
 
-## Suggested path if older versions are required
+## If support is extended further
 
-1. **7.4+ target, 7.3+ caller** — the cheapest useful step: relax the guards, no runtime
-   changes.
-2. **7.1+ target and caller** — add the 7.1/7.2 `PSSession` fallback, remove
-   `FirstPipeInstance`/the retry sleep, and add the 7.1 `Add-Type` references.
-3. **7.0/6.2** — replace `NamedPipeServerStreamAcl` with a portable
+1. **PowerShell 7.1+** — implemented: target-side `Add-Type` references for 7.1,
+   caller-side `PSSession` fallback for 7.1/7.2, and no `FirstPipeInstance`.
+2. **7.0/6.2** — replace `NamedPipeServerStreamAcl` with a portable
    `CreateNamedPipeW`/security-descriptor helper in both the target and the caller control
    pipe.
-4. **Windows PowerShell 5.1** — viable without a custom PSRP server: clone/replace the
+3. **Windows PowerShell 5.1** — viable without a custom PSRP server: clone/replace the
    default IPC server with an ACL-adjusted version using the default pipe name, use the
    process-id connection constructor, and add the caller-side compatibility shim. This is
    a separate port but not a new remoting stack.

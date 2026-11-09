@@ -35,9 +35,10 @@ interactive logged-on session.
 
 - Two pipes per session: a short-lived startup control pipe carrying `OK <pid>`/`ERROR
   <message>`, and the PSRP session pipe. The caller then opens `NamedPipeConnectionInfo`,
-  `RunspaceFactory.CreateRunspace`, and wraps it with `PSSession.Create(..., $PSCmdlet)`.
-- `$PSCmdlet` must be passed to `PSSession.Create`; that is what registers the session in
-  `Get-PSSession`. Do not replace it with the internal constructor for PowerShell 7.6.
+  `RunspaceFactory.CreateRunspace`, and wraps it in a `PSSession`.
+- On 7.3+, pass `$PSCmdlet` to `PSSession.Create`; that is what registers the session in
+  `Get-PSSession`. Keep the 7.1/7.2 fallback (internal constructor + repository) separate;
+  do not use the fallback on 7.3+.
 - The target bootstrap creates the session pipe itself with the explicit DACL before
   starting the listener. The embedded C# helper swaps the stream into
   `RemoteSessionNamedPipeServer` and starts the internal `NamedPipeProcessMediator.Run`.
@@ -69,7 +70,7 @@ interactive logged-on session.
 - Keep the target bootstrap self-contained (stdin/encoded command). The target account
   may not be able to read the caller's module directory; do not replace it with
   `Import-Module`, a shared script, or a separate C# file.
-- The helper depends on PowerShell 7.6 internals (`RemoteSessionNamedPipeServer`,
+- The helper depends on PowerShell 7.1+ internals (`RemoteSessionNamedPipeServer`,
   `<Stream>k__BackingField`, `StartListening`, `NamedPipeProcessMediator.Run`). A
   PowerShell upgrade may require updating it; run the suite if touching it.
 - Target accounts need a password. Passwordless/gMSA/virtual accounts are not supported.
@@ -120,14 +121,20 @@ still applies.
 ## Version compatibility
 
 The manifest, `#Requires`, public cmdlet, and target bootstrap currently enforce
-PowerShell 7.6+. Do not lower a guard casually: `docs/compatibility.md` contains measured
-per-version failures, required patches, and the viable Windows PowerShell 5.1
-default-IPC-server path. If you change a guard or an API used by the bootstrap, update
-that document and rerun the relevant target-version checks.
+PowerShell Core 7.1+. Windows PowerShell 5.1 is intentionally rejected for now; the
+default-IPC-server path for it is documented but not implemented. Do not lower the guard
+to 7.0/6.2: `docs/compatibility.md` contains the measured blockers and required patches.
 
-Notable thresholds (details in `docs/compatibility.md`):
+The 7.1 compatibility branches are deliberate:
 
-- `PipeOptions.FirstPipeInstance`: .NET 8 / PowerShell 7.4+.
+- Target 7.1 needs the conditional `Add-Type -ReferencedAssemblies` block;
+  `PipeOptions.FirstPipeInstance` must stay out of the bootstrap (it is .NET 8+/7.4+).
+- Caller 7.1/7.2 needs the internal `PSSession(RemoteRunspace)` plus
+  `RunspaceRepository.Add` fallback; public `PSSession.Create` only exists from 7.3.
+
+If you change a guard or an API used by the bootstrap, update `docs/compatibility.md` and
+rerun the relevant target-version checks. Notable thresholds:
+
 - `NamedPipeServerStreamAcl`: .NET 5 / PowerShell 7.1+.
 - Public `PSSession.Create`: PowerShell 7.3+.
 - `NamedPipeConnectionInfo(string customPipeName)`: PowerShell 6.2+.

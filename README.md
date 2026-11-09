@@ -20,7 +20,8 @@ and the other session cmdlets, and is removed with `Remove-PSSession`.
 ## Requirements
 
 - Windows.
-- PowerShell 7.6 or later, both in the calling session and at the target executable.
+- PowerShell 7.1 or later, both in the calling session and at the target executable.
+  Windows PowerShell 5.1 is not supported yet.
 - A target account with a password (`-Credential`). Passwordless accounts (gMSAs,
   virtual/service accounts) are not supported yet. The user name can be `DOMAIN\user`,
   `MACHINE\user`, a UPN, or `.\user` to force a local account.
@@ -86,8 +87,8 @@ and consumes the single server instance. This module therefore creates the pipe 
 with the right DACL, then starts the same internal PSRP server that `-CustomPipeName`
 uses. Calling `RemoteSessionNamedPipeServer.CreateCustomNamedPipeServer()` directly is
 equivalent to `-CustomPipeName` — it uses the same default DACL and starts listening
-before returning — so it has the same limitation. That is version-sensitive by design:
-the module targets PowerShell 7.6.
+before returning - so it has the same limitation. That is version-sensitive by design:
+the module supports PowerShell 7.1 and later.
 
 ## Security notes
 
@@ -105,7 +106,8 @@ the module targets PowerShell 7.6.
 
 ## Limitations
 
-- Windows only; PowerShell 7.6+ only.
+- Windows only; PowerShell Core 7.1+ only. Windows PowerShell 5.1 is not supported yet;
+  see `docs/compatibility.md`.
 - No gMSA, `NT SERVICE\*`, virtual, or other passwordless accounts yet.
 - No reconnect after a session is disconnected; create a new session instead.
 - The target process must allow `Add-Type`; the bootstrap compiles a small C# helper
@@ -147,6 +149,9 @@ paths:
 ### Verification notes
 
 - On 2026-11-09 the full suite passed on Windows build 26300 with PowerShell 7.6.9.
+- Target processes 7.1.7, 7.2.24, 7.3.12, 7.4.22, 7.5.9, and 7.6.9 were exercised with
+  `-CurrentUser` from a 7.6.9 caller. Caller/target combinations across 7.1.7, 7.2.24, and
+  7.6.9 also worked, including the 7.1/7.2 `PSSession` fallback.
 - The non-elevated `CreateProcessWithLogonW` path was exercised end to end against a
   temporary local account: the target ran with the correct SID, loaded its own profile,
   could write to its own TEMP directory, and exited when the PSSession was removed. The

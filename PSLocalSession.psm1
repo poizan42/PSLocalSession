@@ -1,4 +1,4 @@
-#Requires -Version 7.6
+#Requires -Version 7.1
 
 Set-StrictMode -Version Latest
 
@@ -23,7 +23,6 @@ $script:ControlMessageTimeoutMs = 30000
 # only then starts the listener, using the same internal PSRP server.
 $script:CSharpSource = @'
 using System;
-using System.IO;
 using System.IO.Pipes;
 using System.Management.Automation.Remoting;
 using System.Reflection;
@@ -65,7 +64,7 @@ namespace PSLocalSession.Server
             {
                 throw new InvalidOperationException(
                     "This PowerShell version does not expose the named-pipe remoting server API " +
-                    "PSLocalSession relies on. PowerShell 7.6 is required.");
+                    "PSLocalSession relies on. PowerShell 7.1 or later is required.");
             }
         }
 
@@ -83,36 +82,17 @@ namespace PSLocalSession.Server
                 var oldStream = (NamedPipeServerStream)StreamProperty.GetValue(server);
                 oldStream.Dispose();
 
-                NamedPipeServerStream stream = null;
-                Exception lastError = null;
-                for (int attempt = 0; attempt < 50; attempt++)
-                {
-                    try
-                    {
-                        stream = NamedPipeServerStreamAcl.Create(
-                            pipeName,
-                            PipeDirection.InOut,
-                            1,
-                            PipeTransmissionMode.Byte,
-                            PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
-                            32768,
-                            32768,
-                            security);
-                        break;
-                    }
-                    catch (IOException e)
-                    {
-                        // The previous instance can take a moment to disappear from the
-                        // object namespace after Dispose.
-                        lastError = e;
-                        System.Threading.Thread.Sleep(50);
-                    }
-                }
-
-                if (stream == null)
-                {
-                    throw new IOException("Could not create the session's named pipe.", lastError);
-                }
+                // FirstPipeInstance is .NET 8+ and is not needed here: the previous stream
+                // has already been disposed and the pipe name is free.
+                NamedPipeServerStream stream = NamedPipeServerStreamAcl.Create(
+                    pipeName,
+                    PipeDirection.InOut,
+                    1,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous,
+                    32768,
+                    32768,
+                    security);
 
                 StreamField.SetValue(server, stream);
 
@@ -232,7 +212,7 @@ function Get-PSLocalSessionPowerShellPath {
     $candidate = [System.IO.Path]::Combine($PSHOME, 'pwsh.exe')
     if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
         throw ("Cannot find pwsh.exe at '{0}'. Use -PowerShellPath to point at a shared " +
-               "PowerShell 7.6+ installation the target account can read." -f $candidate)
+               "PowerShell 7.1+ installation the target account can read." -f $candidate)
     }
     return $candidate
 }
@@ -373,15 +353,33 @@ function Send-StartupMessage {
 }
 
 try {
-    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.6') {
-        throw 'The target PowerShell must be PowerShell 7.6 or later.'
+    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
+        throw ('The target PowerShell must be PowerShell 7.1 or later. ' +
+               'Windows PowerShell 5.1 is not supported yet.')
     }
     if (-not $IsWindows) {
         throw 'The target PowerShell must be running on Windows.'
     }
 
     $csharp = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CS_B64__'))
-    Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
+    if ($PSVersionTable.PSVersion -lt [version]'7.2') {
+        # In 7.1 the pipes ACL types are type-forwarded and Add-Type needs the
+        # implementations explicitly.
+        $referenceAssemblies = @([System.Management.Automation.PSObject].Assembly.Location)
+        foreach ($assemblyName in 'System.IO.Pipes.dll',
+                                  'System.IO.Pipes.AccessControl.dll',
+                                  'System.Security.AccessControl.dll') {
+            $assemblyPath = Join-Path $PSHOME $assemblyName
+            if (Test-Path -LiteralPath $assemblyPath) {
+                $referenceAssemblies += $assemblyPath
+            }
+        }
+        Add-Type -TypeDefinition $csharp -Language CSharp `
+            -ReferencedAssemblies $referenceAssemblies -ErrorAction Stop
+    }
+    else {
+        Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
+    }
 
     $security = [System.IO.Pipes.PipeSecurity]::new()
     $targetSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -843,6 +841,66 @@ function Wait-PSLocalSessionControlMessage {
     throw "Unexpected startup message from the target PowerShell process: $line"
 }
 
+function New-PSLocalSessionPSSession {
+    <#  .SYNOPSIS Wraps a remote runspace in a PSSession.
+
+        PSSession.Create is public from PowerShell 7.3. On 7.1/7.2, use the internal
+        PSSession(RemoteRunspace) constructor and add the result to the current
+        RunspaceRepository so Get-PSSession still sees it. #>
+    [OutputType([System.Management.Automation.Runspaces.PSSession])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Runspaces.Runspace]$Runspace,
+        [string]$TransportName,
+        [Parameter(Mandatory)][System.Management.Automation.PSCmdlet]$Cmdlet
+    )
+
+    $create = [System.Management.Automation.Runspaces.PSSession].GetMethod(
+        'Create',
+        [System.Reflection.BindingFlags]'Static,Public',
+        $null,
+        [type[]]@(
+            [System.Management.Automation.Runspaces.Runspace],
+            [string],
+            [System.Management.Automation.PSCmdlet]),
+        $null)
+    if ($create) {
+        return $create.Invoke($null, @($Runspace, $TransportName, $Cmdlet))
+    }
+
+    $ctor = [System.Management.Automation.Runspaces.PSSession].GetConstructor(
+        [System.Reflection.BindingFlags]'Instance,NonPublic',
+        $null,
+        [type[]]@($Runspace.GetType()),
+        $null)
+    if (-not $ctor) {
+        throw 'This PowerShell version does not expose a usable PSSession constructor.'
+    }
+    $session = $ctor.Invoke(@($Runspace))
+
+    $property = $null
+    $type = $Cmdlet.GetType()
+    while ($type -and -not $property) {
+        $property = $type.GetProperty(
+            'RunspaceRepository',
+            [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+        $type = $type.BaseType
+    }
+    if ($property) {
+        $repository = $property.GetValue($Cmdlet)
+        if ($repository) {
+            $add = $repository.GetType().GetMethod(
+                'Add',
+                [System.Reflection.BindingFlags]'Instance,Public')
+            if ($add) {
+                $null = $add.Invoke($repository, @($session))
+            }
+        }
+    }
+
+    return $session
+}
+
 #endregion
 
 
@@ -923,11 +981,12 @@ function New-LocalPSSession {
         [int]$StartupTimeoutSeconds = 30
     )
 
+    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.1') {
+        throw ('New-LocalPSSession requires PowerShell 7.1 or later. ' +
+               'Windows PowerShell 5.1 is not supported yet.')
+    }
     if (-not $IsWindows) {
         throw 'New-LocalPSSession uses Windows named pipes and Windows logon APIs; it is Windows-only.'
-    }
-    if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion -lt [version]'7.6') {
-        throw 'New-LocalPSSession requires PowerShell 7.6 or later.'
     }
 
     $callerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1064,10 +1123,11 @@ function New-LocalPSSession {
                    "opened: {1}" -f $target.UserName, $_.Exception.Message)
         }
 
-        # PSSession.Create is public API. Passing $PSCmdlet puts the session in the normal
-        # Get-PSSession/Remove-PSSession repository.
-        $session = [System.Management.Automation.Runspaces.PSSession]::Create(
-            $runspace, $null, $PSCmdlet)
+        # Wrap the remote runspace in a PSSession. On 7.3+ this uses the public
+        # PSSession.Create; 7.1/7.2 use the internal constructor + repository fallback.
+        # Passing $PSCmdlet keeps the session in the normal Get-PSSession repository.
+        $session = New-PSLocalSessionPSSession -Runspace $runspace `
+            -TransportName 'NamedPipe' -Cmdlet $PSCmdlet
         if ($Name) { $session.Name = $Name }
 
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
