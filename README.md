@@ -192,6 +192,7 @@ windows:
 ## Layout
 
 ```text
+LICENSE                             MIT license
 PSLocalSession.psd1                 module manifest
 PSLocalSession.psm1                 module implementation
 tests/PSLocalSession.Tests.ps1      Pester 6 suite
@@ -199,8 +200,10 @@ tools/Test-PowerShell51.ps1         manual 5.1 caller/target check
 tools/Test-LocalPSSessionAnotherUser.ps1
 ```
 
-## Author and copyright
+## Author and license
 
 Kasper Fabæch Brandt
 
-Copyright (c) 2026 Kasper Fabæch Brandt. All rights reserved.
+Copyright (c) 2026 Kasper Fabæch Brandt
+
+Released under the [MIT License](LICENSE).

@@ -3,7 +3,7 @@
     ModuleVersion        = '0.1.0'
     GUID                 = '355975f9-7008-43f4-ad07-d3e0486b0142'
     Author               = 'Kasper Fabæch Brandt'
-    Copyright            = '(c) 2026 Kasper Fabæch Brandt. All rights reserved.'
+    Copyright            = '(c) 2026 Kasper Fabæch Brandt'
     Description          = 'Starts PowerShell as another local user and returns a PSSession connected over a local named pipe.'
     PowerShellVersion    = '5.1'
     CompatiblePSEditions = @('Desktop', 'Core')
@@ -13,7 +13,8 @@
     AliasesToExport      = @()
     PrivateData          = @{
         PSData = @{
-            Tags = @('PSSession', 'Remoting', 'NamedPipe', 'Windows', 'RunAs', 'Su')
+            Tags       = @('PSSession', 'Remoting', 'NamedPipe', 'Windows', 'RunAs', 'Su')
+            LicenseUri = 'https://github.com/poizan42/PSLocalSession/blob/main/LICENSE'
         }
     }
 }
