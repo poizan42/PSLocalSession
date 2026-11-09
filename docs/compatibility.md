@@ -173,12 +173,13 @@ executed from a pipe.
   `Limited`. `-RunLevel Limited` forces the limited level.
 - `LocalSystem` is treated as privileged even though it is not a member of the local
   Administrators group.
-- A non-elevated caller with `-Credential` uses an interactive logon. Ordinary
-  administrator accounts are UAC-filtered on that path. The built-in Administrator is the
-  documented exception when `FilterAdministratorToken` is disabled.
-- A non-elevated, non-interactive caller has no supported way to obtain a full
-  administrator token from credentials alone; it needs an elevated/SYSTEM caller, a UAC
-  prompt where available, or a pre-provisioned privileged task/service.
+- A non-elevated caller with `-Credential` uses an interactive logon. Token filtering
+  depends on the target account and UAC policy: ordinary local administrator accounts are
+  commonly filtered, while domain administrator and built-in `Administrator` accounts can
+  receive a full token on the same path.
+- A non-elevated, non-interactive caller has no supported way to obtain a full token for an
+  ordinary local administrator account from credentials alone; it needs an elevated/SYSTEM
+  caller, a UAC prompt where available, or a pre-provisioned privileged task/service.
 
 ## If support is extended further
 

@@ -104,10 +104,11 @@ The returned session also carries diagnostic note properties:
   task is registered with `Highest` by default; if the caller is not allowed to create a
   highest-privilege task, it falls back to `Limited`. Use `-RunLevel Limited` to request
   limited explicitly.
-- `-Credential` from a non-elevated caller uses an interactive logon. An ordinary
-  administrator account gets a UAC-filtered token on that path, and there is no UAC prompt
-  in a non-interactive session. The built-in `Administrator` account is the documented
-  exception when `FilterAdministratorToken` is disabled.
+- `-Credential` from a non-elevated caller uses an interactive logon. Whether that token
+  is filtered depends on the target account and UAC policy. Ordinary local administrator
+  accounts are commonly filtered; domain administrator and built-in `Administrator`
+  accounts can receive a full token on the same path. There is no UAC prompt in a
+  non-interactive session.
 
 ### Why not `pwsh -CustomPipeName`?
 
@@ -157,8 +158,8 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
   supported; see `docs/compatibility.md`.
 - No gMSA, `NT SERVICE\*`, virtual, or other passwordless accounts yet.
 - A non-elevated, non-interactive caller cannot silently obtain a full administrator token
-  for an ordinary administrator account. Run the caller elevated/`LocalSystem`, use the
-  UAC credential prompt where available, or pre-provision a privileged task/service.
+  for an ordinary local administrator account. Run the caller elevated/`LocalSystem`, use
+  the UAC credential prompt where available, or pre-provision a privileged task/service.
 - `-RunLevel Highest` only has an effect when the caller uses the scheduled-task path.
   The non-elevated interactive path inherits the target's logon token.
 - No reconnect after a session is disconnected; create a new session instead.
