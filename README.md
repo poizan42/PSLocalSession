@@ -76,10 +76,15 @@ The returned session also carries diagnostic note properties:
 `-CustomPipeName` would work for an elevated caller (or a session as the current user),
 because PowerShell's pipe DACL includes the target user and `BUILTIN\Administrators`.
 For a non-elevated caller that started the target as *another* user, the caller is in
-neither group. The server-side pipe handle does not carry `WRITE_DAC`, so the DACL cannot
-be changed after creation either. This module therefore creates the pipe itself with the
-right DACL and then drives the same internal server. That is version-sensitive by design:
-the module targets PowerShell 7.6.
+neither group.
+
+The server handle itself lacks `WRITE_DAC`. `ReOpenFile` can return a second handle with
+`WRITE_DAC` to the same pipe instance while it is idle, but `ConsoleHost` begins waiting
+in `ConnectNamedPipe` during startup; by the time the bootstrap runs, `ReOpenFile` fails
+with `ERROR_PIPE_BUSY` (231). Opening `\\.\pipe\name` instead creates a client connection
+and consumes the single server instance. This module therefore creates the pipe itself
+with the right DACL, then starts the same internal PSRP server that `-CustomPipeName`
+uses. That is version-sensitive by design: the module targets PowerShell 7.6.
 
 ## Security notes
 

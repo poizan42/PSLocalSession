@@ -10,10 +10,15 @@ $script:ControlMessageTimeoutMs = 30000
 #
 # PowerShell's own `pwsh -CustomPipeName` creates the named pipe with a DACL that
 # contains the target user (unless that process is elevated) and BUILTIN\Administrators.
-# A non-elevated caller that started the target with CreateProcessWithLogonW is neither,
-# and the server-side pipe handle was opened without WRITE_DAC, so the DACL cannot be
-# adjusted after the fact. Instead, the target creates the pipe itself with an explicit
-# DACL, then drives the very same internal PSRP server that `-CustomPipeName` uses.
+# A non-elevated caller that started the target with CreateProcessWithLogonW is neither.
+#
+# The server handle itself was opened without WRITE_DAC. ReOpenFile *can* return a
+# second handle with WRITE_DAC to the same pipe instance while that instance is idle,
+# but ConsoleHost starts waiting in ConnectNamedPipe during startup. By the time this
+# bootstrap runs, ReOpenFile fails with ERROR_PIPE_BUSY (231). Opening
+# \\.\pipe\<name> instead creates a client connection and consumes the single server
+# instance. So the target creates the pipe itself with an explicit DACL and only then
+# starts the listener, using the same internal PSRP server that `-CustomPipeName` uses.
 $script:CSharpSource = @'
 using System;
 using System.IO;
