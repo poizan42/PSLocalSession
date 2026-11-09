@@ -1,0 +1,15 @@
+# PowerShell / Pester
+TestResults.xml
+testResults.xml
+*.TestResults.xml
+Pester*.xml
+
+# Logs and editor state
+*.log
+.vs/
+.vscode/
+.idea/
+
+# Build output
+bin/
+obj/
