@@ -70,9 +70,15 @@ interactive logged-on session.
   single server instance. The current helper exists specifically to place the ACL before
   listening.
 - Launch matrix is intentional:
-  - elevated caller -> temporary scheduled task -> batch logon;
+  - elevated caller or `LocalSystem` -> temporary scheduled task -> batch logon;
   - non-elevated caller -> `CreateProcessWithLogonW` -> interactive logon;
   - `-CurrentUser` -> direct child process.
+- The scheduled-task path defaults to `-RunLevel Highest` and retries with `Limited` only
+  when task registration fails with access denied / privilege-not-held. `-RunLevel Limited`
+  skips the Highest attempt. Do not silently downgrade for other errors.
+- `Test-PSLocalSessionElevated` must treat `S-1-5-18` (`LocalSystem`) as privileged. SYSTEM
+  is not a member of Administrators, but it can register tasks and cannot use
+  `CreateProcessWithLogonW`.
 - On the scheduled-task success path, unregister the task after the target reports
   `OK`, but do **not** call `Stop-ScheduledTask`; unregistering leaves the already-started
   process alive, and stopping it would kill the session.
@@ -127,6 +133,9 @@ interactive logged-on session.
 - The scheduled-task test uses the test-only `-InteractiveToken` path. Production uses
   `-Credential` and a stored-password/batch logon; do not "simplify" the production path
   to the test path.
+- The Pester scheduled-task test runs non-elevated, so default `Highest` registration is
+  expected to fall back to `Limited`. Do not assert that the registered run level is
+  Highest there; test Highest separately from an elevated caller.
 - When adding a test that creates a session, always remove it and wait for the target PID
   from `LocalPSSessionProcessId` to exit; otherwise later tests inherit live pipes/processes.
 - PowerShell 5.1 has no `PSSession.Transport` property. Check

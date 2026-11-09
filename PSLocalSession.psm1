@@ -26,6 +26,10 @@ function Test-PSLocalSessionElevated {
     param()
 
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($identity.User.Value -eq 'S-1-5-18') {
+        # LocalSystem is not a member of Administrators, but it is fully privileged.
+        return $true
+    }
     return [System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
         [System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
@@ -596,6 +600,26 @@ function Remove-OrphanedPSLocalSessionTask {
     }
 }
 
+function Test-PSLocalSessionAccessDeniedError {
+    <# .SYNOPSIS Whether a task-registration failure is a permission problem. #>
+    [OutputType([bool])]
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $inner = $Exception
+    while ($inner.InnerException) { $inner = $inner.InnerException }
+    try {
+        $hresult = [uint32]([int64]$inner.HResult -band [int64]4294967295)
+    }
+    catch {
+        $hresult = 0
+    }
+    if ($hresult -eq 0x80070005 -or $hresult -eq 0x80070522) {
+        return $true
+    }
+    return ($inner.Message -match 'Access is denied|Access denied')
+}
+
 function Start-PSLocalSessionScheduledTask {
     <#  .SYNOPSIS Starts the target PowerShell through Task Scheduler.
 
@@ -612,6 +636,7 @@ function Start-PSLocalSessionScheduledTask {
         [Parameter(Mandatory, ParameterSetName = 'Password')][pscredential]$Credential,
         [Parameter(Mandatory)][string]$TargetUserName,
         [Parameter(Mandatory, ParameterSetName = 'Interactive')][switch]$InteractiveToken,
+        [ValidateSet('Highest', 'Limited')][string]$RunLevel = 'Highest',
         [switch]$NoProfile
     )
 
@@ -630,25 +655,40 @@ function Start-PSLocalSessionScheduledTask {
         -WorkingDirectory ([System.IO.Path]::Combine($env:SystemRoot, 'System32'))
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Days 1)
-    $task = @{ TaskName = $taskName; TaskPath = $script:TaskPath; Registered = $false }
+    $task = @{ TaskName = $taskName; TaskPath = $script:TaskPath; Registered = $false; RunLevel = $null }
 
     $password = $null
     try {
-        if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
-            $principal = New-ScheduledTaskPrincipal -UserId $TargetUserName `
-                -LogonType Interactive -RunLevel Limited
-            $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
-                -Action $action -Settings $settings -Principal $principal `
-                -Force -ErrorAction Stop
+        $levels = if ($RunLevel -eq 'Highest') { @('Highest', 'Limited') } else { @('Limited') }
+        foreach ($level in $levels) {
+            try {
+                if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
+                    $principal = New-ScheduledTaskPrincipal -UserId $TargetUserName `
+                        -LogonType Interactive -RunLevel $level
+                    $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
+                        -Action $action -Settings $settings -Principal $principal `
+                        -Force -ErrorAction Stop
+                }
+                else {
+                    $password = $Credential.GetNetworkCredential().Password
+                    $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
+                        -Action $action -Settings $settings -User $TargetUserName -Password $password `
+                        -RunLevel $level -Force -ErrorAction Stop
+                }
+                $task.Registered = $true
+                $task.RunLevel = $level
+                Start-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath -ErrorAction Stop
+                break
+            }
+            catch {
+                if ($level -eq 'Highest' -and
+                    (Test-PSLocalSessionAccessDeniedError -Exception $_.Exception)) {
+                    Write-Verbose 'Highest run level was denied; retrying with Limited.'
+                    continue
+                }
+                throw
+            }
         }
-        else {
-            $password = $Credential.GetNetworkCredential().Password
-            $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
-                -Action $action -Settings $settings -User $TargetUserName -Password $password `
-                -RunLevel Limited -Force -ErrorAction Stop
-        }
-        $task.Registered = $true
-        Start-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath -ErrorAction Stop
     }
     catch {
         $hint = Get-PSLocalSessionLogonErrorHint -Exception $_.Exception -LogonPath 'Batch'
@@ -919,6 +959,12 @@ function New-LocalPSSession {
         be able to read and execute this file. The target edition may differ from the
         caller's edition.
 
+    .PARAMETER RunLevel
+        Requested task run level: Highest (default) or Limited. It applies to the temporary
+        scheduled task used for an elevated caller. Highest falls back to Limited when the
+        caller cannot create a highest-privilege task. The non-elevated interactive path
+        inherits the target account's logon token instead.
+
     .PARAMETER StartupTimeoutSeconds
         How long to wait for the target process to start listening. Defaults to 30.
 
@@ -953,6 +999,10 @@ function New-LocalPSSession {
         [Parameter()]
         [ValidateNotNullOrEmpty()]
         [string]$PowerShellPath,
+
+        [Parameter()]
+        [ValidateSet('Highest', 'Limited')]
+        [string]$RunLevel = 'Highest',
 
         [Parameter()]
         [ValidateRange(5, 300)]
@@ -1056,7 +1106,7 @@ function New-LocalPSSession {
             $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwshPath `
                 -BootstrapScriptPath $bootstrapScriptPath `
                 -BootstrapArguments $bootstrapArguments -Credential $Credential `
-                -TargetUserName $target.UserName -NoProfile:$NoProfile
+                -TargetUserName $target.UserName -RunLevel $RunLevel -NoProfile:$NoProfile
 
             $taskName = $task.TaskName
             $taskPath = $task.TaskPath
@@ -1171,6 +1221,9 @@ function New-LocalPSSession {
             'LocalPSSessionPipeName', $sessionPipeName))
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
             'LocalPSSessionConnectionMode', $startup.ConnectionMode))
+        $sessionRunLevel = if ($task) { $task.RunLevel } else { 'Inherited' }
+        $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
+            'LocalPSSessionRunLevel', $sessionRunLevel))
         $session.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new(
             'LocalPSSessionLaunchMethod', $launchMethod))
 

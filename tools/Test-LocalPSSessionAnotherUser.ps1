@@ -37,6 +37,7 @@ try {
 
     Write-Host "Session:  $($session.Name) ($($session.Transport))"
     Write-Host "Launch:   $($session.LocalPSSessionLaunchMethod)"
+    Write-Host "RunLevel: $($session.LocalPSSessionRunLevel)"
     Write-Host "Target PID: $targetProcessId"
     Write-Host ''
 

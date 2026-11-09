@@ -51,6 +51,7 @@ using a password or a second account.
 | `-Name` | Friendly name for the returned `PSSession`. |
 | `-NoProfile` | Start the target with `-NoProfile`. |
 | `-PowerShellPath` | Target executable. Defaults to `$PSHOME\pwsh.exe` on 7.1+, or `$PSHOME\powershell.exe` on 5.1. |
+| `-RunLevel` | `Highest` (default) or `Limited` for the temporary scheduled task. Applies only when an elevated caller uses the scheduled-task path. |
 | `-StartupTimeoutSeconds` | How long to wait for the target to become ready (default 30). |
 
 The returned session also carries diagnostic note properties:
@@ -59,6 +60,7 @@ The returned session also carries diagnostic note properties:
 - `LocalPSSessionUserName`
 - `LocalPSSessionConnectionMode` (`Custom` or `Default`)
 - `LocalPSSessionPipeName` (the custom pipe name, or `<default IPC pipe>`)
+- `LocalPSSessionRunLevel` (`Highest`, `Limited`, or `Inherited`)
 - `LocalPSSessionLaunchMethod` (`CurrentUser`, `CreateProcessWithLogon`, or `ScheduledTask`)
 
 ## How it works
@@ -71,7 +73,9 @@ The returned session also carries diagnostic note properties:
    directory under `%ProgramData%` with a caller/target-only DACL.
 3. A target `pwsh.exe` (7.1+) or `powershell.exe` (5.1) is started:
    - directly for `-CurrentUser`;
-   - through a temporary scheduled task for an elevated caller (batch logon);
+   - through a temporary scheduled task for an elevated caller or `LocalSystem`
+     (batch logon), using `Highest` by default and falling back to `Limited` if the
+     caller cannot create a highest-privilege task;
    - through `CreateProcessWithLogonW` for a non-elevated caller (interactive logon).
 
    The command line contains `-File <bootstrap.ps1>` and the per-session arguments, never
@@ -91,6 +95,19 @@ The returned session also carries diagnostic note properties:
 7. The temporary bootstrap copy is removed. When the `PSSession` is removed, or the
    calling PowerShell process exits, the pipe disconnects and the target process exits by
    itself.
+
+### Token elevation
+
+- `-CurrentUser` inherits the caller's token exactly: an elevated caller gives an elevated
+  target, and a non-elevated caller gives a limited target.
+- `-Credential` with an elevated caller or `LocalSystem` uses the scheduled-task path. The
+  task is registered with `Highest` by default; if the caller is not allowed to create a
+  highest-privilege task, it falls back to `Limited`. Use `-RunLevel Limited` to request
+  limited explicitly.
+- `-Credential` from a non-elevated caller uses an interactive logon. An ordinary
+  administrator account gets a UAC-filtered token on that path, and there is no UAC prompt
+  in a non-interactive session. The built-in `Administrator` account is the documented
+  exception when `FilterAdministratorToken` is disabled.
 
 ### Why not `pwsh -CustomPipeName`?
 
@@ -139,6 +156,11 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
 - Windows only; Windows PowerShell 5.1 or PowerShell 7.1+. PowerShell 7.0/6.2 are not
   supported; see `docs/compatibility.md`.
 - No gMSA, `NT SERVICE\*`, virtual, or other passwordless accounts yet.
+- A non-elevated, non-interactive caller cannot silently obtain a full administrator token
+  for an ordinary administrator account. Run the caller elevated/`LocalSystem`, use the
+  UAC credential prompt where available, or pre-provision a privileged task/service.
+- `-RunLevel Highest` only has an effect when the caller uses the scheduled-task path.
+  The non-elevated interactive path inherits the target's logon token.
 - No reconnect after a session is disconnected; create a new session instead.
 - The target process must allow `Add-Type`; the bootstrap compiles a small C# helper
   in-process. Constrained Language Mode, AppLocker/WDAC, and execution policy can block
@@ -196,6 +218,9 @@ windows:
   temporary local account: the target ran with the correct SID, loaded its own profile,
   could write to its own TEMP directory, and exited when the PSSession was removed. The
   temporary account and its profile were deleted afterwards.
+- From an elevated caller, the default `-RunLevel Highest` scheduled-task path was
+  exercised against a temporary administrator account. The target reported High integrity
+  and `IsInRole(Administrator) = true`; the task and staging copy were removed.
 - The scheduled-task path was exercised with an interactive-token task (registration,
   static bootstrap-file delivery, unregister-while-running, and disconnect cleanup). The
   stored-password / batch-logon variant shares that plumbing; the password-registration

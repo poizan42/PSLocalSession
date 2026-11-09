@@ -60,8 +60,10 @@ removed. The temporary account and profile were deleted afterwards.
 
 The scheduled-task path was exercised for both a 5.1 target and a 7.6 target. It used the
 test-only `-InteractiveToken` registration, which shares the target launch/cleanup plumbing
-with the production stored-password/batch-logon path. A real second-account password/batch
-logon through Task Scheduler has not been exercised separately.
+with the production stored-password/batch-logon path. The production stored-password path
+was also exercised from an elevated caller against a temporary administrator account with
+the default `Highest` run level; the target reported High integrity. The task and staging
+copy were removed afterwards.
 
 ## Connection modes
 
@@ -161,6 +163,22 @@ under Task Scheduler's action-argument limit (`0x800700CE`). It also gives antiv
 software a static script and C# files on disk to inspect, and allows the bootstrap to be
 code-signed later. No script, base64 blob, or reader stub is placed on the command line or
 executed from a pipe.
+
+## Elevation and run level
+
+- `-CurrentUser` inherits the caller token. An elevated caller gives an elevated target; a
+  non-elevated caller gives a limited target.
+- An elevated caller or `LocalSystem` with `-Credential` uses Task Scheduler. The default
+  requested run level is `Highest`; if task registration is denied, the module retries with
+  `Limited`. `-RunLevel Limited` forces the limited level.
+- `LocalSystem` is treated as privileged even though it is not a member of the local
+  Administrators group.
+- A non-elevated caller with `-Credential` uses an interactive logon. Ordinary
+  administrator accounts are UAC-filtered on that path. The built-in Administrator is the
+  documented exception when `FilterAdministratorToken` is disabled.
+- A non-elevated, non-interactive caller has no supported way to obtain a full
+  administrator token from credentials alone; it needs an elevated/SYSTEM caller, a UAC
+  prompt where available, or a pre-provisioned privileged task/service.
 
 ## If support is extended further
 

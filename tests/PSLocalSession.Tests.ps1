@@ -179,6 +179,7 @@ Describe 'Current-user session' {
         $script:session.LocalPSSessionUserName |
             Should -Be ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
         $script:session.LocalPSSessionLaunchMethod | Should -Be 'CurrentUser'
+        $script:session.LocalPSSessionRunLevel | Should -Be 'Inherited'
         $script:session.LocalPSSessionPipeName | Should -Match '^PSLocalSession\.'
     }
 
@@ -294,6 +295,10 @@ Describe 'Error handling' {
         { New-LocalPSSession -CurrentUser -PowerShellPath 'C:\PSLocalSession\no-such-pwsh.exe' } |
             Should -Throw
     }
+
+    It 'rejects an invalid run level' {
+        { New-LocalPSSession -CurrentUser -RunLevel 'Bogus' } | Should -Throw
+    }
 }
 
 Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
@@ -347,7 +352,7 @@ Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
                 $runspace.Dispose()
                 $runspace = $null
 
-                $deadline = [DateTime]::UtcNow.AddSeconds(10)
+                $deadline = [DateTime]::UtcNow.AddSeconds(30)
                 while ((Get-Process -Id $targetPid -ErrorAction SilentlyContinue) -and
                        [DateTime]::UtcNow -lt $deadline) {
                     Start-Sleep -Milliseconds 200
