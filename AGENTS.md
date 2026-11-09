@@ -87,6 +87,22 @@ interactive logged-on session.
 - When adding a test that creates a session, always remove it and wait for the target PID
   from `LocalPSSessionProcessId` to exit; otherwise later tests inherit live pipes/processes.
 
+## Git commits
+
+- AI-authored commits use an imperative subject, then a short body (1-3 sentences) for
+  non-trivial changes explaining what changed and why. Omit the body for truly trivial
+  changes; never restate the subject.
+- End the message with a `Co-Authored-By` trailer using the identity in the harness's
+  `Your Model` block. Template:
+  `Co-Authored-By: <Name> (<provider-id>/<model-id>) <noreply@opencode.ai>`
+  Current example:
+  `Co-Authored-By: DeepSeek V4.1 Flash (opencode-go/deepseek-v4.1-flash) <noreply@opencode.ai>`
+- Do not infer the model from `OPENCODE_*` environment variables; they do not expose it.
+  The system prompt's `Your Model` block is authoritative, and `tools.opencode.models`
+  can confirm the display name and model id.
+- One trailer per model that materially contributed, all at the end after a blank line.
+  Human-authored commits are unaffected.
+
 ## Version compatibility
 
 The manifest, `#Requires`, public cmdlet, and target bootstrap currently enforce
