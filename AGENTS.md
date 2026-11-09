@@ -92,16 +92,30 @@ interactive logged-on session.
 - AI-authored commits use an imperative subject, then a short body (1-3 sentences) for
   non-trivial changes explaining what changed and why. Omit the body for truly trivial
   changes; never restate the subject.
-- End the message with a `Co-Authored-By` trailer using the identity in the harness's
-  `Your Model` block. Template:
-  `Co-Authored-By: <Name> (<provider-id>/<model-id>) <noreply@opencode.ai>`
-  Current example:
-  `Co-Authored-By: DeepSeek V4.1 Flash (opencode-go/deepseek-v4.1-flash) <noreply@opencode.ai>`
-- Do not infer the model from `OPENCODE_*` environment variables; they do not expose it.
-  The system prompt's `Your Model` block is authoritative, and `tools.opencode.models`
-  can confirm the display name and model id.
+- End the message with a `Co-Authored-By` trailer naming the model and its version:
+  `Co-Authored-By: <Model name and version> (<provider-id>/<model-id>) <noreply@localhost>`
+  Use the real model identity reported by the current harness or model metadata. If the
+  display name has no version, include the exact model ID (and a release date if useful);
+  never invent a version. Use a provider/harness `noreply` address when one is known;
+  `noreply@localhost` is the neutral fallback because the trailer is a record, not a
+  deliverable mailbox. If no model identity is exposed at all, use
+  `Co-Authored-By: AI assistant <noreply@localhost>` rather than guessing.
 - One trailer per model that materially contributed, all at the end after a blank line.
   Human-authored commits are unaffected.
+- Do not carry a model identity over from another session or harness. If you switch
+  models, use the model that actually authored the commit.
+
+### OpenCode-specific model discovery
+
+The system prompt's `Your Model` block is authoritative under OpenCode: Name, Provider ID,
+and Model ID. Current session example:
+
+`Co-Authored-By: DeepSeek V4.1 Flash (opencode-go/deepseek-v4.1-flash) <noreply@opencode.ai>`
+
+`OPENCODE_*` environment variables do not expose the model. `tools.opencode.models` can
+confirm the display name and model ID. Other harnesses should use their equivalent model
+metadata (system prompt, CLI, config, or model catalog); the general trailer rule above
+still applies.
 
 ## Version compatibility
 
