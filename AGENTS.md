@@ -38,10 +38,9 @@ interactive logged-on session.
 
 ## Architecture invariants
 
-- Three pipes per session: a short-lived control pipe carrying
-  `OK <pid> Custom|Default`/`ERROR <message>`, a short-lived bootstrap pipe carrying the
-  header plus static bootstrap, and the PSRP session pipe. The caller then opens
-  `NamedPipeConnectionInfo`, `RunspaceFactory.CreateRunspace`, and wraps it in a
+- Two pipes per session: a short-lived control pipe carrying
+  `OK <pid> Custom|Default`/`ERROR <message>`, and the PSRP session pipe. The caller then
+  opens `NamedPipeConnectionInfo`, `RunspaceFactory.CreateRunspace`, and wraps it in a
   `PSSession`.
 - There are two connection modes:
   - `Custom`: 7.1+ caller and 7.1+ target. The target creates the session pipe itself with
@@ -54,11 +53,11 @@ interactive logged-on session.
     `NamedPipeConnectionInfo(targetProcessId)`.
 - Do not replace `Default` with a custom pipe name for 5.1. A custom AppDomain/pipe name
   connected but failed the 5.1 PSRP handshake; only the default name works.
-- The bootstrap is static and embeds both C# helpers. The target compiles only the helper
-  matching its own `PSEdition`; do not reintroduce a caller-side target preflight just to
-  select one helper.
-- Per-session bootstrap values belong in the pipe header and as parameters on the static
-  script. Do not regenerate or substitute the script body per session.
+- The bootstrap is a static script file shipped with the module. It selects the 5.1 or
+  7.1+ `.cs` pipe helper at runtime; do not reintroduce a caller-side target preflight just
+  to select one helper.
+- Per-session bootstrap values are parameters on the static script. Do not regenerate,
+  substitute, base64-encode, or pipe the script body per session.
 - On 7.3+, pass `$PSCmdlet` to `PSSession.Create`; that is what registers the session in
   `Get-PSSession`. On 5.1/7.1/7.2 use the internal `PSSession(RemoteRunspace)` constructor
   plus `RunspaceRepository.Add`; do not mix the branches.
@@ -77,24 +76,32 @@ interactive logged-on session.
 - On the scheduled-task success path, unregister the task after the target reports
   `OK`, but do **not** call `Stop-ScheduledTask`; unregistering leaves the already-started
   process alive, and stopping it would kill the session.
-- Every launch path passes a short reader stub on the target command line. The stub
-  contains only the bootstrap pipe name; the caller writes a small `key=value` header plus
-  the static bootstrap to that pipe. Do not put the script, a compressed script, or an
-  encoded script back on the command line: `CreateProcessWithLogonW` has a
+- Every launch path passes `-ExecutionPolicy Bypass -File <bootstrap.ps1>` plus the
+  per-session parameters. Do not put the script, a compressed script, an encoded script,
+  or a pipe-executed reader stub on the command line: `CreateProcessWithLogonW` has a
   1024-character limit, and Task Scheduler rejects long action arguments with
   `LastTaskResult 0x800700CE`.
-- The reader stub is intentionally one line and under about 750 characters. Keep it that
-  way; the complete command line must stay under 1024 characters for the non-elevated
-  `CreateProcessWithLogonW` path.
+- Keep the target command line under 1024 characters for the non-elevated
+  `CreateProcessWithLogonW` path. The static path and arguments leave ample room; do not
+  add large inline data.
+- For a different target user, stage a copy when the module is under the caller profile.
+  For other locations use `Test-PSLocalSessionTargetCanRead`, which calls
+  `GetEffectiveRightsFromAclW` for the target SID and checks file read plus
+  parent-directory traverse. Any failure means "cannot read"; stage a copy. Do not broaden
+  the module ACL.
+- A staged copy lives directly under `%ProgramData%\PSLocalSession-<guid>` with an
+  explicit caller/target-only DACL. Remove it after the target reports readiness; a
+  one-day stale sweep handles caller crashes.
 - The target exits when the PSRP pipe disconnects; that is the session lifecycle. Do not
   add a second shutdown mechanism or kill processes on the success path.
-- The C# helpers are `$script:CSharpSource` (7.1+) and `$script:CSharpSource51` inside
-  `PSLocalSession.psm1`, base64-inserted into the static bootstrap and compiled by
-  `Add-Type` **inside the target process**. There is no separate C# project; C# changes are
-  only exercised by starting a real target.
-- Keep the target bootstrap self-contained (bootstrap pipe). The target account may not be
-  able to read the caller's module directory; do not replace it with `Import-Module`, a
-  shared script, or a separate C# file.
+- The target C# helpers are `PSLocalSession.PipeServer.Core.cs` (7.1+) and
+  `PSLocalSession.PipeServer.Desktop.cs` (5.1), compiled by `Add-Type -Path` **inside the
+  target process**. The caller's effective-rights helper is
+  `PSLocalSession.AccessCheck.cs`. There is no separate C# project; C# changes are only
+  exercised by starting a real target.
+- Keep the target bootstrap as static module files. The target account may not be able to
+  read the caller's module directory; stage a copy rather than using `Import-Module`, a
+  generated script, or an inline `-Command` payload.
 - The 7.1+ helper depends on `RemoteSessionNamedPipeServer`,
   `<Stream>k__BackingField`, `StartListening`, and `NamedPipeProcessMediator.Run`. The 5.1
   helper uses `IPCNamedPipeServerEnabled`, `IPCNamedPipeServer`, `_serverPipeStream`, and
@@ -107,6 +114,10 @@ interactive logged-on session.
 - Current-user tests can pass while cross-user ACLs are broken. Use the manual second-account
   script for ACL, profile, TEMP, and logon-right changes; run it from both 7.x and 5.1 when
   touching the 5.1 path.
+- When the module is under a user profile, a cross-user run must stage a copy under
+  `%ProgramData%\PSLocalSession-<guid>`; use `-Verbose` to confirm the access check chose
+  staging, and verify no staging directories remain afterwards. If the access check fails
+  for domain groups, that is expected and must fall back to staging, not fail the session.
 - Windows PowerShell 5.1 target sessions use the target's default AppDomain pipe. The 5.1
   Pester test creates and removes one; always wait for its target PID to exit before the
   next test.
@@ -169,7 +180,7 @@ Deliberate compatibility branches:
   `NamedPipeConnectionInfo(string)`, and `$IsWindows`; use the .NET Framework
   `NamedPipeServerStream(PipeSecurity)` constructor, `ProcessStartInfo.Arguments`, the
   process-id connection constructor, and `PSEdition` respectively.
-- The bootstrap must stay off the command line; see the bootstrap-pipe bullets above.
+- The bootstrap must stay a static file executed by path; see the bootstrap bullets above.
 
 If you change a guard or an API used by the bootstrap, update `docs/compatibility.md` and
 rerun the relevant target-version checks. Notable thresholds:

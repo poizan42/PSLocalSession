@@ -64,34 +64,53 @@ Describe 'Command-line quoting' {
 
 Describe 'Bootstrap delivery' {
     InModuleScope PSLocalSession {
-        It 'keeps the target command line short and carries only the pipe name' {
-            $pipeName = 'PSLocalSession.Boot.test'
-            $reader = New-PSLocalSessionBootstrapReaderCommand -PipeName $pipeName
-            $reader | Should -Match ([regex]::Escape($pipeName))
-            $reader | Should -Not -Match 'CSharp'
+        It 'uses the static bootstrap and C# files shipped with the module' {
+            Test-Path -LiteralPath $script:BootstrapScriptPath -PathType Leaf | Should -BeTrue
+            $moduleDirectory = Split-Path -Parent $script:BootstrapScriptPath
+            foreach ($name in $script:BootstrapSupportFiles) {
+                Test-Path -LiteralPath (Join-Path $moduleDirectory $name) -PathType Leaf |
+                    Should -BeTrue
+            }
 
-            $argumentLine = ConvertTo-PSLocalSessionCommandLine `
-                -ArgumentList @('-NoLogo', '-NonInteractive', '-Command', $reader)
-            $argumentLine.Length | Should -BeLessThan 1024
+            $bootstrapText = Get-Content -LiteralPath $script:BootstrapScriptPath -Raw
+            $bootstrapText | Should -Not -Match 'FromBase64String|__CS'
         }
 
-        It 'sends per-session values in a header before the static script' {
-            $payload = New-PSLocalSessionBootstrapPayload `
+        It 'checks effective rights without a target token' {
+            $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $probe = Join-Path $env:TEMP ('PSLocalSession-acl-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+            try {
+                Set-Content -LiteralPath $probe -Value 'probe'
+                Test-PSLocalSessionEffectiveAccess -Path $probe -TargetSid $sid `
+                    -RequiredMask 0x81 | Should -BeTrue
+            }
+            finally {
+                Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'passes the script path and arguments without inline code' {
+            $bootstrapArguments = New-PSLocalSessionBootstrapArguments `
                 -PipeName 'PSLocalSession.session' `
                 -ControlPipeName 'PSLocalSession.Ctl.test' `
                 -CallerSid 'S-1-5-21-1-2-3-1001' `
                 -ConnectTimeoutSeconds 60 -CallerIsDesktop $true
+            $arguments = New-PSLocalSessionTargetArguments `
+                -BootstrapScriptPath 'C:\Program Files\PSLocalSession\PSLocalSession.Bootstrap.ps1' `
+                -BootstrapArguments $bootstrapArguments
 
-            $lines = $payload -split "`n"
-            $lines[0] | Should -Be 'PSLocalSessionBootstrap/1'
-            $lines | Should -Contain 'PipeName=PSLocalSession.session'
-            $lines | Should -Contain 'ControlPipeName=PSLocalSession.Ctl.test'
-            $lines | Should -Contain 'CallerSid=S-1-5-21-1-2-3-1001'
-            $lines | Should -Contain 'ConnectTimeoutSeconds=60'
-            $lines | Should -Contain 'CallerIsDesktop=1'
-            $payload | Should -Match '(?m)^\[CmdletBinding\(\)\]'
-            $payload | Should -Match '(?m)^param\('
-            $payload | Should -Not -Match '__CS'
+            $arguments | Should -Contain '-File'
+            $arguments | Should -Contain 'C:\Program Files\PSLocalSession\PSLocalSession.Bootstrap.ps1'
+            $arguments | Should -Contain '-ExecutionPolicy'
+            $arguments | Should -Contain 'Bypass'
+            $arguments | Should -Contain '-PipeName'
+            $arguments | Should -Contain 'PSLocalSession.session'
+            $arguments | Should -Contain '-CallerIsDesktop'
+            $arguments | Should -Contain '1'
+            ($arguments -join ' ') | Should -Not -Match 'ScriptBlock|CSharp|Invoke-Expression'
+
+            $argumentLine = ConvertTo-PSLocalSessionCommandLine -ArgumentList $arguments
+            $argumentLine.Length | Should -BeLessThan 1024
         }
     }
 }
@@ -285,32 +304,22 @@ Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
             $pwsh = Get-PSLocalSessionPowerShellPath
             $pipe = 'PSLocalSession.{0}' -f [guid]::NewGuid().ToString('N')
             $controlName = 'PSLocalSession.Ctl.{0}' -f [guid]::NewGuid().ToString('N')
-            $bootstrapName = 'PSLocalSession.Boot.{0}' -f [guid]::NewGuid().ToString('N')
-            $readerCommand = New-PSLocalSessionBootstrapReaderCommand -PipeName $bootstrapName
-            $payload = New-PSLocalSessionBootstrapPayload -PipeName $pipe `
+            $bootstrapArguments = New-PSLocalSessionBootstrapArguments -PipeName $pipe `
                 -ControlPipeName $controlName -CallerSid $caller.User.Value `
                 -ConnectTimeoutSeconds 60 -CallerIsDesktop $false
 
             $control = New-PSLocalSessionControlPipe -PipeName $controlName `
                 -CallerSid $caller.User -TargetSid $target.Sid
             $connectionTask = $control.WaitForConnectionAsync()
-            $bootstrap = New-PSLocalSessionBootstrapPipe -PipeName $bootstrapName `
-                -CallerSid $caller.User -TargetSid $target.Sid
-            $bootstrapConnectionTask = $bootstrap.WaitForConnectionAsync()
             $task = $null
             $runspace = $null
             $targetPid = 0
             try {
                 $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwsh `
-                    -BootstrapCommand $readerCommand -TargetUserName $target.UserName `
+                    -BootstrapScriptPath $script:BootstrapScriptPath `
+                    -BootstrapArguments $bootstrapArguments -TargetUserName $target.UserName `
                     -InteractiveToken -NoProfile
                 $task.Registered | Should -BeTrue
-
-                $readerCommand.Length | Should -BeLessThan 1024
-                Send-PSLocalSessionBootstrapPayload -Pipe $bootstrap `
-                    -ConnectionTask $bootstrapConnectionTask -Payload $payload -TimeoutMs 30000
-                $bootstrap.Dispose()
-                $bootstrap = $null
 
                 $startup = Wait-PSLocalSessionControlMessage -ControlPipe $control `
                     -ConnectionTask $connectionTask -TimeoutMs 30000
@@ -347,7 +356,6 @@ Describe 'Scheduled-task plumbing' -Tag 'ScheduledTask' {
             }
             finally {
                 if ($control) { $control.Dispose() }
-                if ($bootstrap) { $bootstrap.Dispose() }
                 if ($runspace) { $runspace.Dispose() }
                 if ($task -and $task.Registered) { Stop-PSLocalSessionScheduledTask -Task $task }
                 if ($targetPid) { Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }

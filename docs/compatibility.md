@@ -12,10 +12,9 @@ accept:
 PowerShell 7.0 and 6.2 remain unsupported; see [If support is extended
 further](#if-support-is-extended-further).
 
-The caller and target do not have to be the same edition or version. The bootstrap is
-static and embeds both C# helpers. The target selects the helper at runtime, and selects
-the connection mode from its own edition plus the caller-edition flag in the bootstrap
-header.
+The caller and target do not have to be the same edition or version. The static bootstrap
+and both C# helper files ship with the module. The target selects the helper at runtime,
+and selects the connection mode from its own edition plus the caller-edition argument.
 
 ## Measured behaviour
 
@@ -126,35 +125,42 @@ but swaps the 7.1+ `<Stream>k__BackingField`.
 - `PipesAclExtensions.SetAccessControl` exists in 6.2/7.0 but fails on an unconnected server
   pipe handle with an unauthorized-operation error; it is not a substitute for creating
   the pipe with the desired DACL.
+- `GetEffectiveRightsFromAclW` is available on every supported Windows version. It is
+  deprecated in favor of the Authz API, but it evaluates a DACL for a SID without a token,
+  which is enough for the conservative "can the target read this?" check. Any failure or
+  ambiguity falls back to staging a copy.
 
 ## Bootstrap delivery
 
-Every launch path uses the same delivery mechanism. The target command line contains a
-short reader stub and the bootstrap pipe name; it never contains the script. The caller
-writes a small `key=value` header followed by the static bootstrap to the bootstrap pipe:
+The static `PSLocalSession.Bootstrap.ps1` script and the two plain C# pipe helpers ship as
+module files. Every launch path uses the same delivery mechanism: the target command line
+contains `-ExecutionPolicy Bypass -File <bootstrap.ps1>` plus the per-session parameters,
+never the script text:
 
 ```text
-PSLocalSessionBootstrap/1
-PipeName=...
-ControlPipeName=...
-CallerSid=...
-ConnectTimeoutSeconds=...
-CallerIsDesktop=0|1
-
-[CmdletBinding()]
-param(...)
-...
+-File C:\...\PSLocalSession.Bootstrap.ps1
+-PipeName PSLocalSession...
+-ControlPipeName PSLocalSession.Ctl...
+-CallerSid S-1-5-...
+-ConnectTimeoutSeconds 90
+-CallerIsDesktop 0|1
 ```
 
-The reader stub connects to the pipe, parses the header, and invokes the static script with
-the header values as parameters. The script is about 25 KB, including both C# helpers; the
-reader command is under 750 characters.
+For `-CurrentUser`, the script is loaded from the module directory. For `-Credential`, a
+module under the caller profile is staged directly. For other locations, the caller checks
+the target SID's effective read access to the bootstrap and helper files, and traverse
+access to their parent directories, using `GetEffectiveRightsFromAclW`. This does not
+require a token for the target account. If the check fails for any reason (including an
+unreachable domain group or an inherited deny ACE), the module treats it as no access and
+stages a copy under `%ProgramData%\PSLocalSession-<guid>` with a caller/target-only DACL.
+The caller uses the module path when the target can read it, and removes any staged copy
+after the target reports readiness.
 
 This keeps the command line under `CreateProcessWithLogonW`'s 1024-character limit and well
-under Task Scheduler's action-argument limit (`0x800700CE`). It also avoids writing the
-bootstrap to a shared temporary file and avoids relying on the target account being able
-to read the caller's module directory. The bootstrap pipe uses the same caller/target-only
-DACL as the control and session pipes.
+under Task Scheduler's action-argument limit (`0x800700CE`). It also gives antivirus
+software a static script and C# files on disk to inspect, and allows the bootstrap to be
+code-signed later. No script, base64 blob, or reader stub is placed on the command line or
+executed from a pipe.
 
 ## If support is extended further
 

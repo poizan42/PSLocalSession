@@ -27,6 +27,11 @@ with `Remove-PSSession`.
   virtual/service accounts) are not supported yet. The user name can be `DOMAIN\user`,
   `MACHINE\user`, a UPN, or `.\user` to force a local account.
 - The target must be able to read and execute the chosen `pwsh.exe`/`powershell.exe`.
+- For `-Credential` sessions, the target account must be able to read the module's
+  `PSLocalSession.Bootstrap.ps1` and pipe-server `.cs` files. A module under the caller's
+  profile is staged directly; for other paths the module checks the target's effective
+  read/traverse rights with `GetEffectiveRightsFromAclW`. If needed, it copies those static
+  files to `%ProgramData%\PSLocalSession-<guid>\` with a caller/target-only DACL.
 - Logon rights depend on the launch path:
   - **Elevated caller** starts the target through a temporary scheduled task, which is
     a *batch* logon. The account needs **Log on as a batch job**.
@@ -58,22 +63,23 @@ The returned session also carries diagnostic note properties:
 
 ## How it works
 
-1. The caller creates a short-lived control pipe and bootstrap pipe, both with an explicit
-   DACL for the caller and target. In 7.1+ custom-pipe mode it also chooses a random
-   session-pipe name.
-2. A target `pwsh.exe` (7.1+) or `powershell.exe` (5.1) is started:
+1. The caller creates a short-lived control pipe with an explicit DACL for the caller and
+   target. In 7.1+ custom-pipe mode it also chooses a random session-pipe name.
+2. If the target is another user, the caller stages a copy when the module is under its
+   profile; otherwise it checks whether the target SID can read and traverse the module's
+   bootstrap files. If needed, it copies the static script and C# pipe helpers to a unique
+   directory under `%ProgramData%` with a caller/target-only DACL.
+3. A target `pwsh.exe` (7.1+) or `powershell.exe` (5.1) is started:
    - directly for `-CurrentUser`;
    - through a temporary scheduled task for an elevated caller (batch logon);
    - through `CreateProcessWithLogonW` for a non-elevated caller (interactive logon).
 
-   The command line contains only a short reader stub and the bootstrap pipe name, never
-   the script.
-3. The caller writes a small header plus the static bootstrap to the bootstrap pipe. The
-   header carries the pipe names, caller SID, timeout, and caller edition. The target
-   chooses the 5.1 or 7.1+ C# helper at runtime.
-4. The target runs the bootstrap:
+   The command line contains `-File <bootstrap.ps1>` and the per-session arguments, never
+   the script itself.
+4. The target runs the static bootstrap:
+   - it selects the 5.1 or 7.1+ `.cs` pipe helper at runtime;
    - 7.1+ with a 7.1+ caller creates a custom session pipe with the explicit DACL and
-     starts the internal PSRP server.
+     starts the internal PSRP server;
    - 5.1, or any session involving a 5.1 caller, replaces the target's default IPC
      server with an ACL-adjusted clone using the same default AppDomain pipe name.
 5. The target writes `OK <pid> Custom` or `OK <pid> Default` (or `ERROR <message>`) to
@@ -82,8 +88,9 @@ The returned session also carries diagnostic note properties:
    for `Custom`, the process-id constructor for `Default`. It wraps the runspace in a
    `PSSession` using the public `PSSession.Create` on 7.3+, or the internal-constructor
    fallback on 5.1/7.1/7.2.
-7. When the `PSSession` is removed, or the calling PowerShell process exits, the pipe
-   disconnects and the target process exits by itself.
+7. The temporary bootstrap copy is removed. When the `PSSession` is removed, or the
+   calling PowerShell process exits, the pipe disconnects and the target process exits by
+   itself.
 
 ### Why not `pwsh -CustomPipeName`?
 
@@ -110,11 +117,13 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
 
 ## Security notes
 
-- The control, bootstrap, and session pipes are local-only. Their DACLs contain only the
-  target account and the caller; the bootstrap script is not placed on a command line or
-  in a shared file. In the 5.1/default mode the target's default IPC server is replaced
-  with an ACL-adjusted clone; the original inherited server is disposed. No network
-  listener is created.
+- The control and session pipes are local-only. Their DACLs contain only the target
+  account and the caller. In the 5.1/default mode the target's default IPC server is
+  replaced with an ACL-adjusted clone; the original inherited server is disposed. No
+  network listener is created.
+- The bootstrap is a static script and plain C# files shipped with the module, executed by
+  path. When a target-readable copy is needed, the staging directory has a caller/target
+  DACL and is removed after the target starts. Other users cannot read or modify it.
 - The non-elevated path never puts the password on a command line; `ProcessStartInfo`
   carries it as a `SecureString`.
 - The elevated path must give Task Scheduler a plaintext password for the duration of
@@ -123,7 +132,7 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
   scheduled-task launch. If the caller is killed at exactly the wrong moment, a task can
   remain and hold the stored credential; the warning/cleanup path reports its name.
 - The target process is launched with `-NonInteractive`. Target profiles still load unless
-  `-NoProfile` is used, but profile prompts fail rather than consume the bootstrap stream.
+  `-NoProfile` is used, but profile prompts fail rather than consume startup input.
 
 ## Limitations
 
@@ -132,8 +141,9 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
 - No gMSA, `NT SERVICE\*`, virtual, or other passwordless accounts yet.
 - No reconnect after a session is disconnected; create a new session instead.
 - The target process must allow `Add-Type`; the bootstrap compiles a small C# helper
-  in-process. Constrained Language Mode, AppLocker/WDAC, or a read-only target TEMP can
-  block that.
+  in-process. Constrained Language Mode, AppLocker/WDAC, and execution policy can block
+  that. `-ExecutionPolicy Bypass` is passed, but Group Policy `AllSigned`/`Restricted`
+  can still win over it.
 - The named-pipe server uses PowerShell's internal remoting types, so a future PowerShell
   version that changes them needs a module update.
 - Loading the target profile can run arbitrary code as the target, exactly like starting a
@@ -152,7 +162,7 @@ The suite covers:
 - current-user sessions end to end (real process, real pipe, real PSSession);
 - a Windows PowerShell 5.1 target through the default IPC pipe clone;
 - concurrent sessions and process cleanup;
-- the scheduled-task plumbing, including bootstrap-pipe delivery;
+- the scheduled-task plumbing, including static bootstrap-file delivery;
 - basic error cases.
 
 The scheduled-task test needs an interactive logged-on session and permission to
@@ -179,13 +189,15 @@ windows:
 - Windows PowerShell 5.1 target and caller combinations (5.1->5.1, 5.1->7.1/7.2/7.6,
   7.1/7.2/7.6->5.1) were exercised. The 5.1 scheduled-task path was exercised with both a
   5.1 and a 7.6 target. A cross-user matrix (5.1 caller->5.1 target, 7.6 caller->5.1
-  target, and 7.6 caller->7.6 target) passed against a temporary local account.
+  target, and 7.6 caller->7.6 target) passed against a temporary local account. Because
+  that module was under a user profile, the effective-rights check selected the staged
+  copy; the staging directory was removed after each session.
 - The non-elevated `CreateProcessWithLogonW` path was exercised end to end against a
   temporary local account: the target ran with the correct SID, loaded its own profile,
   could write to its own TEMP directory, and exited when the PSSession was removed. The
   temporary account and its profile were deleted afterwards.
 - The scheduled-task path was exercised with an interactive-token task (registration,
-  bootstrap-pipe delivery, unregister-while-running, and disconnect cleanup). The
+  static bootstrap-file delivery, unregister-while-running, and disconnect cleanup). The
   stored-password / batch-logon variant shares that plumbing; the password-registration
   error path was also exercised.
 
@@ -195,6 +207,10 @@ windows:
 LICENSE                             MIT license
 PSLocalSession.psd1                 module manifest
 PSLocalSession.psm1                 module implementation
+PSLocalSession.Bootstrap.ps1        target-side bootstrap
+PSLocalSession.PipeServer.Core.cs   7.1+ pipe helper
+PSLocalSession.PipeServer.Desktop.cs 5.1 pipe helper
+PSLocalSession.AccessCheck.cs       caller-side effective-rights check
 tests/PSLocalSession.Tests.ps1      Pester 6 suite
 tools/Test-PowerShell51.ps1         manual 5.1 caller/target check
 tools/Test-LocalPSSessionAnotherUser.ps1

@@ -7,6 +7,13 @@
     Description          = 'Starts PowerShell as another local user and returns a PSSession connected over a local named pipe.'
     PowerShellVersion    = '5.1'
     CompatiblePSEditions = @('Desktop', 'Core')
+    FileList             = @(
+        'PSLocalSession.psm1'
+        'PSLocalSession.Bootstrap.ps1'
+        'PSLocalSession.PipeServer.Core.cs'
+        'PSLocalSession.PipeServer.Desktop.cs'
+        'PSLocalSession.AccessCheck.cs'
+    )
     FunctionsToExport    = @('New-LocalPSSession')
     CmdletsToExport      = @()
     VariablesToExport    = @()
