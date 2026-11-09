@@ -84,7 +84,10 @@ in `ConnectNamedPipe` during startup; by the time the bootstrap runs, `ReOpenFil
 with `ERROR_PIPE_BUSY` (231). Opening `\\.\pipe\name` instead creates a client connection
 and consumes the single server instance. This module therefore creates the pipe itself
 with the right DACL, then starts the same internal PSRP server that `-CustomPipeName`
-uses. That is version-sensitive by design: the module targets PowerShell 7.6.
+uses. Calling `RemoteSessionNamedPipeServer.CreateCustomNamedPipeServer()` directly is
+equivalent to `-CustomPipeName` — it uses the same default DACL and starts listening
+before returning — so it has the same limitation. That is version-sensitive by design:
+the module targets PowerShell 7.6.
 
 ## Security notes
 

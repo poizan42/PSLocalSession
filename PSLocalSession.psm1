@@ -17,8 +17,10 @@ $script:ControlMessageTimeoutMs = 30000
 # but ConsoleHost starts waiting in ConnectNamedPipe during startup. By the time this
 # bootstrap runs, ReOpenFile fails with ERROR_PIPE_BUSY (231). Opening
 # \\.\pipe\<name> instead creates a client connection and consumes the single server
-# instance. So the target creates the pipe itself with an explicit DACL and only then
-# starts the listener, using the same internal PSRP server that `-CustomPipeName` uses.
+# instance. Calling CreateCustomNamedPipeServer explicitly is equivalent to
+# -CustomPipeName (same default DACL, same immediate listening), so it has the same
+# limitation. The target therefore creates the pipe itself with an explicit DACL and
+# only then starts the listener, using the same internal PSRP server.
 $script:CSharpSource = @'
 using System;
 using System.IO;
