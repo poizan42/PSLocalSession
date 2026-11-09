@@ -462,70 +462,6 @@ function Get-PSLocalSessionPowerShellPath {
     return $candidate
 }
 
-function Get-PSLocalSessionTargetInfo {
-    <#  .SYNOPSIS Identifies the target executable's edition/version before launch.
-
-        The target may be Windows PowerShell 5.1 or PowerShell 7.1+. The caller uses this
-        to select the correct self-contained C# helper for the bootstrap and keep the
-        scheduled-task command line under the Task Scheduler limit. #>
-    [OutputType([pscustomobject])]
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$PowerShellPath
-    )
-
-    $command = '$PSVersionTable.PSEdition + "|" + $PSVersionTable.PSVersion.ToString()'
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $PowerShellPath
-    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $command)
-    if ([System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
-        foreach ($argument in $arguments) {
-            [void]$startInfo.ArgumentList.Add($argument)
-        }
-    }
-    else {
-        $startInfo.Arguments = ConvertTo-PSLocalSessionCommandLine -ArgumentList $arguments
-    }
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.WorkingDirectory = [System.IO.Path]::Combine($env:SystemRoot, 'System32')
-
-    $process = $null
-    try {
-        $process = [System.Diagnostics.Process]::Start($startInfo)
-        $output = $process.StandardOutput.ReadToEnd()
-        $errorText = $process.StandardError.ReadToEnd()
-        if (-not $process.WaitForExit(15000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            throw 'The target PowerShell did not report its version within 15 seconds.'
-        }
-        if ($process.ExitCode -ne 0) {
-            throw ("Exit code {0}: {1}" -f $process.ExitCode, $errorText.Trim())
-        }
-    }
-    catch {
-        throw ("Could not query the target PowerShell at '{0}': {1}" -f
-            $PowerShellPath, $_.Exception.Message)
-    }
-    finally {
-        if ($process) { $process.Dispose() }
-    }
-
-    $line = @($output -split "`r?`n" | Where-Object { $_ -match '^(Core|Desktop)\|' } | Select-Object -Last 1)
-    if (-not $line) {
-        throw ("The target PowerShell at '{0}' did not report its edition and version." -f
-            $PowerShellPath)
-    }
-
-    $parts = $line -split '\|', 2
-    return [pscustomobject]@{
-        PSEdition = $parts[0]
-        Version   = [version]$parts[1]
-    }
-}
-
 function ConvertTo-PSLocalSessionCommandLineArgument {
     <# .SYNOPSIS Quotes one argument for a Windows command line. #>
     [OutputType([string])]
@@ -576,45 +512,17 @@ function ConvertTo-PSLocalSessionCommandLine {
     }) -join ' ')
 }
 
-function ConvertTo-PSLocalSessionCompressedBootstrapCommand {
-    <#  .SYNOPSIS Builds a short -Command argument containing a gzip-compressed bootstrap.
-
-        Task Scheduler rejects long action arguments; the raw bootstrap (especially the
-        embedded C# helper) can exceed that limit. The target decodes this with the in-box
-        .NET compression classes before invoking the real bootstrap. #>
-    [OutputType([string])]
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Script
-    )
-
-    $bytes = [Text.Encoding]::UTF8.GetBytes($Script)
-    $memory = [IO.MemoryStream]::new()
-    $gzip = [IO.Compression.GZipStream]::new(
-        $memory, [IO.Compression.CompressionMode]::Compress, $true)
-    try {
-        $gzip.Write($bytes, 0, $bytes.Length)
-    }
-    finally {
-        $gzip.Dispose()
-    }
-    $base64 = [Convert]::ToBase64String($memory.ToArray())
-    $memory.Dispose()
-
-    $decoder = @'
-$b='{0}';$m=[IO.MemoryStream]::new([Convert]::FromBase64String($b));$g=[IO.Compression.GZipStream]::new($m,[IO.Compression.CompressionMode]::Decompress);$r=[IO.StreamReader]::new($g,[Text.Encoding]::UTF8);$s=$r.ReadToEnd();$r.Dispose();$g.Dispose();$m.Dispose();[ScriptBlock]::Create($s).Invoke()
-'@
-    return ($decoder -f $base64)
-}
-
-function New-PSLocalSessionControlPipe {
-    <# .SYNOPSIS Creates the short-lived startup/identity pipe used by the target. #>
+function New-PSLocalSessionPipe {
+    <# .SYNOPSIS Creates a local named-pipe server with an ACL for caller and target. #>
     [OutputType([System.IO.Pipes.NamedPipeServerStream])]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PipeName,
         [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$CallerSid,
-        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$TargetSid
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$TargetSid,
+        [System.IO.Pipes.PipeDirection]$Direction = [System.IO.Pipes.PipeDirection]::InOut,
+        [int]$InBufferSize = 4096,
+        [int]$OutBufferSize = 4096
     )
 
     $security = [System.IO.Pipes.PipeSecurity]::new()
@@ -633,46 +541,72 @@ function New-PSLocalSessionControlPipe {
         # .NET Framework has the PipeSecurity constructor directly.
         return [System.IO.Pipes.NamedPipeServerStream]::new(
             $PipeName,
-            [System.IO.Pipes.PipeDirection]::InOut,
+            $Direction,
             1,
             [System.IO.Pipes.PipeTransmissionMode]::Byte,
             [System.IO.Pipes.PipeOptions]::Asynchronous,
-            4096,
-            4096,
+            $InBufferSize,
+            $OutBufferSize,
             $security)
     }
 
     return [System.IO.Pipes.NamedPipeServerStreamAcl]::Create(
         $PipeName,
-        [System.IO.Pipes.PipeDirection]::InOut,
+        $Direction,
         1,
         [System.IO.Pipes.PipeTransmissionMode]::Byte,
         [System.IO.Pipes.PipeOptions]::Asynchronous,
-        4096,
-        4096,
+        $InBufferSize,
+        $OutBufferSize,
         $security)
 }
 
-function New-PSLocalSessionBootstrapScript {
-    <# .SYNOPSIS Builds the self-contained script executed inside the target process. #>
-    [OutputType([string])]
+function New-PSLocalSessionControlPipe {
+    <# .SYNOPSIS Creates the short-lived startup/identity pipe used by the target. #>
+    [OutputType([System.IO.Pipes.NamedPipeServerStream])]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PipeName,
-        [Parameter(Mandatory)][string]$ControlPipeName,
-        [Parameter(Mandatory)][string]$CallerSid,
-        [Parameter(Mandatory)][int]$ConnectTimeoutSeconds,
-        [Parameter(Mandatory)][bool]$CallerIsDesktop,
-        [Parameter(Mandatory)][bool]$TargetIsDesktop
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$CallerSid,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$TargetSid
     )
 
-    $template = @'
+    return New-PSLocalSessionPipe -PipeName $PipeName `
+        -CallerSid $CallerSid -TargetSid $TargetSid
+}
+
+function New-PSLocalSessionBootstrapPipe {
+    <# .SYNOPSIS Creates the pipe that carries the bootstrap header and static script. #>
+    [OutputType([System.IO.Pipes.NamedPipeServerStream])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PipeName,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$CallerSid,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$TargetSid
+    )
+
+    return New-PSLocalSessionPipe -PipeName $PipeName `
+        -CallerSid $CallerSid -TargetSid $TargetSid `
+        -InBufferSize 65536 -OutBufferSize 65536
+}
+
+# The bootstrap is static. Per-session values arrive in a small header on the
+# bootstrap pipe, not as command-line arguments or template substitutions.
+$script:BootstrapScriptTemplate = @'
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$PipeName,
+    [Parameter(Mandatory)][string]$ControlPipeName,
+    [Parameter(Mandatory)][string]$CallerSid,
+    [Parameter(Mandatory)][int]$ConnectTimeoutSeconds,
+    [Parameter(Mandatory)][bool]$CallerIsDesktop
+)
+$pipeName = $PipeName
+$controlPipe = $ControlPipeName
+$callerSid = $CallerSid
+$connectTimeoutSeconds = $ConnectTimeoutSeconds
+$callerIsDesktop = $CallerIsDesktop
 $ErrorActionPreference = 'Stop'
-$pipeName = '__PIPE__'
-$controlPipe = '__CONTROL__'
-$callerSid = '__CALLER_SID__'
-$connectTimeoutSeconds = __CONNECT_TIMEOUT__
-$callerIsDesktop = __CALLER_IS_DESKTOP__
 
 function Send-StartupMessage {
     param([string]$Text)
@@ -712,7 +646,8 @@ try {
         }
     }
 
-    $csharp = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CS_B64__'))
+    $csharpBase64 = if ($isDesktopTarget) { '__CS51_B64__' } else { '__CS_B64__' }
+    $csharp = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($csharpBase64))
     if ($isDesktopTarget) {
         Add-Type -TypeDefinition $csharp -Language CSharp -ErrorAction Stop
     }
@@ -802,18 +737,110 @@ catch {
 }
 '@
 
-    return $template.
-        Replace('__CS_B64__', $(if ($TargetIsDesktop) {
-            $script:CSharp51Base64
+$script:BootstrapScript = $script:BootstrapScriptTemplate.
+    Replace('__CS_B64__', $script:CSharpBase64).
+    Replace('__CS51_B64__', $script:CSharp51Base64)
+
+function New-PSLocalSessionBootstrapPayload {
+    <#  .SYNOPSIS Builds the bootstrap-pipe payload: a small header plus the static script.
+
+        The header carries only per-session values. The script itself never changes, so
+        nothing large has to be encoded into a command line. #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PipeName,
+        [Parameter(Mandatory)][string]$ControlPipeName,
+        [Parameter(Mandatory)][string]$CallerSid,
+        [Parameter(Mandatory)][int]$ConnectTimeoutSeconds,
+        [Parameter(Mandatory)][bool]$CallerIsDesktop
+    )
+
+    $header = @(
+        'PSLocalSessionBootstrap/1'
+        ('PipeName={0}' -f $PipeName)
+        ('ControlPipeName={0}' -f $ControlPipeName)
+        ('CallerSid={0}' -f $CallerSid)
+        ('ConnectTimeoutSeconds={0}' -f $ConnectTimeoutSeconds)
+        ('CallerIsDesktop={0}' -f [int]$CallerIsDesktop)
+        ''
+    ) -join "`n"
+    return $header + "`n" + $script:BootstrapScript
+}
+
+function New-PSLocalSessionBootstrapReaderCommand {
+    <#  .SYNOPSIS Builds the short reader stub passed to the target executable.
+
+        Only the bootstrap pipe name goes on the command line. The stub reads the header
+        and static script from the ACL-protected pipe, then invokes the script with the
+        header values as parameters. #>
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PipeName
+    )
+
+    $command = @'
+$p=[IO.Pipes.NamedPipeClientStream]::new('.', '__PIPE__', [IO.Pipes.PipeDirection]::In);$p.Connect(300000);$r=[IO.StreamReader]::new($p,[Text.Encoding]::UTF8);$v=$r.ReadLine();if($v -ne 'PSLocalSessionBootstrap/1'){throw ('Unexpected bootstrap protocol: ' + $v)};$h=@{};while(($l=$r.ReadLine()) -ne ''){if($null -eq $l){throw 'Unexpected end of bootstrap header.'};$n,$x=$l -split '=',2;$h[$n]=$x};$s=$r.ReadToEnd();$r.Dispose();$p.Dispose();& ([ScriptBlock]::Create($s)) -PipeName $h['PipeName'] -ControlPipeName $h['ControlPipeName'] -CallerSid $h['CallerSid'] -ConnectTimeoutSeconds ([int]$h['ConnectTimeoutSeconds']) -CallerIsDesktop ([bool]([int]$h['CallerIsDesktop']))
+'@
+    return $command.Trim().Replace('__PIPE__', $PipeName)
+}
+
+function Send-PSLocalSessionBootstrapPayload {
+    <#  .SYNOPSIS Waits for the target to connect and writes the bootstrap payload.
+
+        The optional process/check callbacks let a failed logon or an exited target fail
+        fast instead of waiting for the full bootstrap timeout. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.IO.Pipes.NamedPipeServerStream]$Pipe,
+        [Parameter(Mandatory)][System.Threading.Tasks.Task]$ConnectionTask,
+        [Parameter(Mandatory)][string]$Payload,
+        [System.Diagnostics.Process]$Process,
+        [scriptblock]$Diagnose,
+        [scriptblock]$CheckFailure,
+        [int]$TimeoutMs = $script:ControlMessageTimeoutMs
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $nextFailureCheck = [DateTime]::UtcNow.AddSeconds(2)
+    while (-not $ConnectionTask.IsCompleted) {
+        if ($Process -and $Process.HasExited) {
+            throw ("The target process exited with code {0} before reading its bootstrap." -f
+                $Process.ExitCode)
         }
-        else {
-            $script:CSharpBase64
-        })).
-        Replace('__PIPE__', $PipeName).
-        Replace('__CONTROL__', $ControlPipeName).
-        Replace('__CALLER_SID__', $CallerSid).
-        Replace('__CONNECT_TIMEOUT__', [string]$ConnectTimeoutSeconds).
-        Replace('__CALLER_IS_DESKTOP__', $(if ($CallerIsDesktop) { '1' } else { '0' }))
+        if ($CheckFailure -and [DateTime]::UtcNow -ge $nextFailureCheck) {
+            $failure = & $CheckFailure
+            if ($failure) { throw "The target session could not start: $failure" }
+            $nextFailureCheck = [DateTime]::UtcNow.AddSeconds(1)
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $detail = if ($Diagnose) { & $Diagnose } else { '' }
+            throw ("The target PowerShell process did not connect for its bootstrap within " +
+                "{0} seconds.{1}" -f [Math]::Round($TimeoutMs / 1000),
+                $(if ($detail) { " $detail" } else { '' }))
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    if ($ConnectionTask.IsFaulted) {
+        $inner = $ConnectionTask.Exception.GetBaseException()
+        throw "The bootstrap pipe failed: $($inner.Message)"
+    }
+
+    $writer = [System.IO.StreamWriter]::new(
+        $Pipe, [System.Text.UTF8Encoding]::new($false), 4096, $true)
+    try {
+        $writer.Write($Payload)
+        $writer.Flush()
+        $Pipe.WaitForPipeDrain()
+    }
+    catch {
+        throw "Could not send the bootstrap payload: $($_.Exception.GetBaseException().Message)"
+    }
+    finally {
+        $writer.Dispose()
+    }
 }
 
 #endregion
@@ -904,16 +931,14 @@ function Start-PSLocalSessionProcess {
     <#  .SYNOPSIS Starts the target PowerShell executable directly, optionally as
         another user via CreateProcessWithLogonW.
 
-        The bootstrap is delivered on standard input: the target runs a short command that
-        reads all of stdin and invokes it as a script block. CreateProcessWithLogonW
-        documents a 1024-character command line limit, and the self-contained bootstrap
-        is much longer than that. Standard input has no such limit and needs no shared
-        script file. #>
+        The target receives a short reader stub whose only large data is the bootstrap
+        pipe name. The stub reads the static bootstrap from that pipe, so the command line
+        stays well under CreateProcessWithLogonW's 1024-character limit. #>
     [OutputType([System.Diagnostics.Process])]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PowerShellPath,
-        [Parameter(Mandatory)][string]$BootstrapScript,
+        [Parameter(Mandatory)][string]$BootstrapCommand,
         [pscredential]$Credential,
         [switch]$NoProfile
     )
@@ -925,7 +950,7 @@ function Start-PSLocalSessionProcess {
     $arguments.Add('-NonInteractive')
     if ($NoProfile) { $arguments.Add('-NoProfile') }
     $arguments.Add('-Command')
-    $arguments.Add('[ScriptBlock]::Create([Console]::In.ReadToEnd()).Invoke()')
+    $arguments.Add($BootstrapCommand)
     if ([System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
         foreach ($argument in $arguments) {
             [void]$startInfo.ArgumentList.Add($argument)
@@ -939,7 +964,6 @@ function Start-PSLocalSessionProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $startInfo.WorkingDirectory = [System.IO.Path]::Combine($env:SystemRoot, 'System32')
-    $startInfo.RedirectStandardInput = $true
 
     if ($Credential) {
         $name = $Credential.UserName
@@ -966,8 +990,6 @@ function Start-PSLocalSessionProcess {
     }
     try {
         $process = [System.Diagnostics.Process]::Start($startInfo)
-        $process.StandardInput.Write($BootstrapScript)
-        $process.StandardInput.Close()
         return $process
     }
     catch {
@@ -1421,29 +1443,20 @@ function New-LocalPSSession {
         $target.UserName, $target.Sid.Value, $launchMethod)
 
     $pwshPath = Get-PSLocalSessionPowerShellPath -Path $PowerShellPath
-    $targetInfo = Get-PSLocalSessionTargetInfo -PowerShellPath $pwshPath
-    $targetIsDesktop = $targetInfo.PSEdition -eq 'Desktop'
-    if ($targetIsDesktop) {
-        if ($targetInfo.Version -lt [version]'5.1') {
-            throw 'The target PowerShell must be Windows PowerShell 5.1 or later.'
-        }
-    }
-    elseif ($targetInfo.Version -lt [version]'7.1') {
-        throw 'The target PowerShell must be PowerShell 7.1 or later.'
-    }
 
     $pipeName = 'PSLocalSession.{0}' -f [guid]::NewGuid().ToString('N')
     $controlPipeName = 'PSLocalSession.Ctl.{0}' -f [guid]::NewGuid().ToString('N')
+    $bootstrapPipeName = 'PSLocalSession.Boot.{0}' -f [guid]::NewGuid().ToString('N')
     $connectTimeoutSeconds = [Math]::Max($script:BootstrapConnectTimeoutSeconds, $StartupTimeoutSeconds + 30)
-
-    $bootstrap = New-PSLocalSessionBootstrapScript -PipeName $pipeName `
+    $bootstrapReaderCommand = New-PSLocalSessionBootstrapReaderCommand -PipeName $bootstrapPipeName
+    $bootstrapPayload = New-PSLocalSessionBootstrapPayload -PipeName $pipeName `
         -ControlPipeName $controlPipeName -CallerSid $callerSid.Value `
-        -ConnectTimeoutSeconds $connectTimeoutSeconds `
-        -CallerIsDesktop $callerIsDesktop -TargetIsDesktop $targetIsDesktop
-    $taskCommand = ConvertTo-PSLocalSessionCompressedBootstrapCommand -Script $bootstrap
+        -ConnectTimeoutSeconds $connectTimeoutSeconds -CallerIsDesktop $callerIsDesktop
 
     $controlPipe = $null
     $connectionTask = $null
+    $bootstrapPipe = $null
+    $bootstrapConnectionTask = $null
     $process = $null
     $task = $null
     $runspace = $null
@@ -1456,10 +1469,13 @@ function New-LocalPSSession {
         $controlPipe = New-PSLocalSessionControlPipe -PipeName $controlPipeName `
             -CallerSid $callerSid -TargetSid $target.Sid
         $connectionTask = $controlPipe.WaitForConnectionAsync()
+        $bootstrapPipe = New-PSLocalSessionBootstrapPipe -PipeName $bootstrapPipeName `
+            -CallerSid $callerSid -TargetSid $target.Sid
+        $bootstrapConnectionTask = $bootstrapPipe.WaitForConnectionAsync()
 
         if ($launchMethod -eq 'ScheduledTask') {
             $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwshPath `
-                -BootstrapCommand $taskCommand -Credential $Credential `
+                -BootstrapCommand $bootstrapReaderCommand -Credential $Credential `
                 -TargetUserName $target.UserName -NoProfile:$NoProfile
 
             $taskName = $task.TaskName
@@ -1500,7 +1516,8 @@ function New-LocalPSSession {
         else {
             $credentialForProcess = if ($launchMethod -eq 'CreateProcessWithLogon') { $Credential } else { $null }
             $process = Start-PSLocalSessionProcess -PowerShellPath $pwshPath `
-                -BootstrapScript $bootstrap -Credential $credentialForProcess -NoProfile:$NoProfile
+                -BootstrapCommand $bootstrapReaderCommand -Credential $credentialForProcess `
+                -NoProfile:$NoProfile
 
             $targetProcess = $process
             $diagnose = {
@@ -1510,6 +1527,14 @@ function New-LocalPSSession {
                 return "Target process $($targetProcess.Id) is still running but did not report readiness."
             }
         }
+
+        Write-Verbose 'Sending the bootstrap script to the target.'
+        Send-PSLocalSessionBootstrapPayload -Pipe $bootstrapPipe `
+            -ConnectionTask $bootstrapConnectionTask -Payload $bootstrapPayload `
+            -Process $process -Diagnose $diagnose -CheckFailure $checkFailure `
+            -TimeoutMs ([Math]::Max(5000, $StartupTimeoutSeconds * 1000))
+        $bootstrapPipe.Dispose()
+        $bootstrapPipe = $null
 
         Write-Verbose 'Waiting for the target PowerShell process to report readiness.'
         $startup = Wait-PSLocalSessionControlMessage -ControlPipe $controlPipe `
@@ -1583,6 +1608,9 @@ function New-LocalPSSession {
     finally {
         if ($controlPipe) {
             $controlPipe.Dispose()
+        }
+        if ($bootstrapPipe) {
+            $bootstrapPipe.Dispose()
         }
 
         if (-not $success) {

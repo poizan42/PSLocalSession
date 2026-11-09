@@ -27,8 +27,6 @@ with `Remove-PSSession`.
   virtual/service accounts) are not supported yet. The user name can be `DOMAIN\user`,
   `MACHINE\user`, a UPN, or `.\user` to force a local account.
 - The target must be able to read and execute the chosen `pwsh.exe`/`powershell.exe`.
-  The caller must also be able to execute it once, because the module queries its edition
-  and version before building the bootstrap.
 - Logon rights depend on the launch path:
   - **Elevated caller** starts the target through a temporary scheduled task, which is
     a *batch* logon. The account needs **Log on as a batch job**.
@@ -60,24 +58,31 @@ The returned session also carries diagnostic note properties:
 
 ## How it works
 
-1. The caller always creates a short-lived startup control pipe. In 7.1+ custom-pipe mode
-   it also chooses a random session-pipe name.
+1. The caller creates a short-lived control pipe and bootstrap pipe, both with an explicit
+   DACL for the caller and target. In 7.1+ custom-pipe mode it also chooses a random
+   session-pipe name.
 2. A target `pwsh.exe` (7.1+) or `powershell.exe` (5.1) is started:
    - directly for `-CurrentUser`;
    - through a temporary scheduled task for an elevated caller (batch logon);
    - through `CreateProcessWithLogonW` for a non-elevated caller (interactive logon).
-3. The target runs a self-contained bootstrap:
-   - 7.1+ with a 7.1+ caller creates a custom session pipe with an explicit DACL and
+
+   The command line contains only a short reader stub and the bootstrap pipe name, never
+   the script.
+3. The caller writes a small header plus the static bootstrap to the bootstrap pipe. The
+   header carries the pipe names, caller SID, timeout, and caller edition. The target
+   chooses the 5.1 or 7.1+ C# helper at runtime.
+4. The target runs the bootstrap:
+   - 7.1+ with a 7.1+ caller creates a custom session pipe with the explicit DACL and
      starts the internal PSRP server.
    - 5.1, or any session involving a 5.1 caller, replaces the target's default IPC
      server with an ACL-adjusted clone using the same default AppDomain pipe name.
-4. The target writes `OK <pid> Custom` or `OK <pid> Default` (or `ERROR <message>`) to
+5. The target writes `OK <pid> Custom` or `OK <pid> Default` (or `ERROR <message>`) to
    the control pipe.
-5. The caller opens the pipe with `NamedPipeConnectionInfo`: the string constructor for
-   `Custom`, the process-id constructor for `Default`. It wraps the runspace in a
+6. The caller opens the session pipe with `NamedPipeConnectionInfo`: the string constructor
+   for `Custom`, the process-id constructor for `Default`. It wraps the runspace in a
    `PSSession` using the public `PSSession.Create` on 7.3+, or the internal-constructor
    fallback on 5.1/7.1/7.2.
-6. When the `PSSession` is removed, or the calling PowerShell process exits, the pipe
+7. When the `PSSession` is removed, or the calling PowerShell process exits, the pipe
    disconnects and the target process exits by itself.
 
 ### Why not `pwsh -CustomPipeName`?
@@ -105,10 +110,11 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
 
 ## Security notes
 
-- The session pipe is local-only and its DACL contains only the target account and the
-  caller. In the 5.1/default mode the target's default IPC server is replaced with an
-  ACL-adjusted clone; the original inherited server is disposed. No network listener is
-  created.
+- The control, bootstrap, and session pipes are local-only. Their DACLs contain only the
+  target account and the caller; the bootstrap script is not placed on a command line or
+  in a shared file. In the 5.1/default mode the target's default IPC server is replaced
+  with an ACL-adjusted clone; the original inherited server is disposed. No network
+  listener is created.
 - The non-elevated path never puts the password on a command line; `ProcessStartInfo`
   carries it as a `SecureString`.
 - The elevated path must give Task Scheduler a plaintext password for the duration of
@@ -146,7 +152,7 @@ The suite covers:
 - current-user sessions end to end (real process, real pipe, real PSSession);
 - a Windows PowerShell 5.1 target through the default IPC pipe clone;
 - concurrent sessions and process cleanup;
-- the scheduled-task plumbing, including the compressed bootstrap command;
+- the scheduled-task plumbing, including bootstrap-pipe delivery;
 - basic error cases.
 
 The scheduled-task test needs an interactive logged-on session and permission to
@@ -179,7 +185,7 @@ windows:
   could write to its own TEMP directory, and exited when the PSSession was removed. The
   temporary account and its profile were deleted afterwards.
 - The scheduled-task path was exercised with an interactive-token task (registration,
-  compressed bootstrap command, unregister-while-running, and disconnect cleanup). The
+  bootstrap-pipe delivery, unregister-while-running, and disconnect cleanup). The
   stored-password / batch-logon variant shares that plumbing; the password-registration
   error path was also exercised.
 

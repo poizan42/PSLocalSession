@@ -38,28 +38,32 @@ interactive logged-on session.
 
 ## Architecture invariants
 
-- Two pipes per session: a short-lived startup control pipe carrying
-  `OK <pid> Custom|Default`/`ERROR <message>`, and the PSRP session pipe. The caller then
-  opens `NamedPipeConnectionInfo`, `RunspaceFactory.CreateRunspace`, and wraps it in a
+- Three pipes per session: a short-lived control pipe carrying
+  `OK <pid> Custom|Default`/`ERROR <message>`, a short-lived bootstrap pipe carrying the
+  header plus static bootstrap, and the PSRP session pipe. The caller then opens
+  `NamedPipeConnectionInfo`, `RunspaceFactory.CreateRunspace`, and wraps it in a
   `PSSession`.
 - There are two connection modes:
   - `Custom`: 7.1+ caller and 7.1+ target. The target creates the session pipe itself with
     the explicit DACL before starting the listener; the embedded 7.1+ C# helper swaps the
     stream into `RemoteSessionNamedPipeServer` and starts `NamedPipeProcessMediator.Run`.
     The caller uses `NamedPipeConnectionInfo(string)`.
-  - `Default`: any 5.1 caller or 5.1 target. The 5.1 C# helper disables and disposes the
-    target's default `IPCNamedPipeServer`, then recreates it with the same default AppDomain
-    pipe name and the explicit DACL. The caller uses
+  - `Default`: any 5.1 caller or 5.1 target. The target's matching C# helper disables and
+    disposes the default `IPCNamedPipeServer`, then recreates it with the same default
+    AppDomain pipe name and the explicit DACL. The caller uses
     `NamedPipeConnectionInfo(targetProcessId)`.
 - Do not replace `Default` with a custom pipe name for 5.1. A custom AppDomain/pipe name
   connected but failed the 5.1 PSRP handshake; only the default name works.
-- Detect the target edition with `Get-PSLocalSessionTargetInfo` before generating the
-  bootstrap. Only one C# helper is embedded, selected from that result.
+- The bootstrap is static and embeds both C# helpers. The target compiles only the helper
+  matching its own `PSEdition`; do not reintroduce a caller-side target preflight just to
+  select one helper.
+- Per-session bootstrap values belong in the pipe header and as parameters on the static
+  script. Do not regenerate or substitute the script body per session.
 - On 7.3+, pass `$PSCmdlet` to `PSSession.Create`; that is what registers the session in
   `Get-PSSession`. On 5.1/7.1/7.2 use the internal `PSSession(RemoteRunspace)` constructor
   plus `RunspaceRepository.Add`; do not mix the branches.
-- Both pipe DACLs contain only the target account and the caller. Do not broaden them to
-  `Everyone`/`Authenticated Users` to work around access failures; fix the SID/ACL.
+- All three pipe DACLs contain only the target account and the caller. Do not broaden them
+  to `Everyone`/`Authenticated Users` to work around access failures; fix the SID/ACL.
 - Do **not** replace this with `pwsh -CustomPipeName`, `CreateCustomNamedPipeServer`, or
   `ReOpenFile`-then-`SetSecurityInfo`. `CustomPipeName` starts `ConnectNamedPipe` before
   the bootstrap runs, so `ReOpenFile` on its listening handle fails with
@@ -73,24 +77,24 @@ interactive logged-on session.
 - On the scheduled-task success path, unregister the task after the target reports
   `OK`, but do **not** call `Stop-ScheduledTask`; unregistering leaves the already-started
   process alive, and stopping it would kill the session.
-- Direct/non-admin bootstrap delivery uses stdin:
-  `[ScriptBlock]::Create([Console]::In.ReadToEnd()).Invoke()`. This is required because
-  `CreateProcessWithLogonW` has a 1024-character command-line limit. Do not use
-  `-Command -` (only the first stdin line is executed) and do not switch this path to
-  `-EncodedCommand`.
-- The scheduled-task path uses `-Command` with a gzip-compressed, base64-encoded bootstrap
-  (`ConvertTo-PSLocalSessionCompressedBootstrapCommand`), not `-EncodedCommand`. Raw or
-  encoded bootstraps exceed the Task Scheduler action-argument limit
-  (`LastTaskResult 0x800700CE`). Keep the decoder short and in-box.
+- Every launch path passes a short reader stub on the target command line. The stub
+  contains only the bootstrap pipe name; the caller writes a small `key=value` header plus
+  the static bootstrap to that pipe. Do not put the script, a compressed script, or an
+  encoded script back on the command line: `CreateProcessWithLogonW` has a
+  1024-character limit, and Task Scheduler rejects long action arguments with
+  `LastTaskResult 0x800700CE`.
+- The reader stub is intentionally one line and under about 750 characters. Keep it that
+  way; the complete command line must stay under 1024 characters for the non-elevated
+  `CreateProcessWithLogonW` path.
 - The target exits when the PSRP pipe disconnects; that is the session lifecycle. Do not
   add a second shutdown mechanism or kill processes on the success path.
 - The C# helpers are `$script:CSharpSource` (7.1+) and `$script:CSharpSource51` inside
-  `PSLocalSession.psm1`, base64-inserted into the bootstrap and compiled by `Add-Type`
-  **inside the target process**. There is no separate C# project; C# changes are only
-  exercised by starting a real target.
-- Keep the target bootstrap self-contained (stdin/compressed command). The target account
-  may not be able to read the caller's module directory; do not replace it with
-  `Import-Module`, a shared script, or a separate C# file.
+  `PSLocalSession.psm1`, base64-inserted into the static bootstrap and compiled by
+  `Add-Type` **inside the target process**. There is no separate C# project; C# changes are
+  only exercised by starting a real target.
+- Keep the target bootstrap self-contained (bootstrap pipe). The target account may not be
+  able to read the caller's module directory; do not replace it with `Import-Module`, a
+  shared script, or a separate C# file.
 - The 7.1+ helper depends on `RemoteSessionNamedPipeServer`,
   `<Stream>k__BackingField`, `StartListening`, and `NamedPipeProcessMediator.Run`. The 5.1
   helper uses `IPCNamedPipeServerEnabled`, `IPCNamedPipeServer`, `_serverPipeStream`, and
@@ -165,7 +169,7 @@ Deliberate compatibility branches:
   `NamedPipeConnectionInfo(string)`, and `$IsWindows`; use the .NET Framework
   `NamedPipeServerStream(PipeSecurity)` constructor, `ProcessStartInfo.Arguments`, the
   process-id connection constructor, and `PSEdition` respectively.
-- The scheduled-task path must stay compressed; see the bootstrap bullet above.
+- The bootstrap must stay off the command line; see the bootstrap-pipe bullets above.
 
 If you change a guard or an API used by the bootstrap, update `docs/compatibility.md` and
 rerun the relevant target-version checks. Notable thresholds:

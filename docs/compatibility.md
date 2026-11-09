@@ -12,9 +12,10 @@ accept:
 PowerShell 7.0 and 6.2 remain unsupported; see [If support is extended
 further](#if-support-is-extended-further).
 
-The caller and target do not have to be the same edition or version. The module detects the
-target edition and version before generating the bootstrap, then embeds the matching C#
-helper and selects the matching connection mode.
+The caller and target do not have to be the same edition or version. The bootstrap is
+static and embeds both C# helpers. The target selects the helper at runtime, and selects
+the connection mode from its own edition plus the caller-edition flag in the bootstrap
+header.
 
 ## Measured behaviour
 
@@ -67,9 +68,9 @@ logon through Task Scheduler has not been exercised separately.
 
 ### `Custom` (7.1+ caller and 7.1+ target)
 
-The caller creates the session pipe itself with a DACL containing only the target account
-and the caller, swaps the stream into PowerShell's internal
-`RemoteSessionNamedPipeServer`, and connects with
+The caller chooses the pipe name. The target creates the session pipe itself with a DACL
+containing only the target account and the caller, swaps the stream into PowerShell's
+internal `RemoteSessionNamedPipeServer`, and the caller connects with
 `NamedPipeConnectionInfo(string customPipeName)`.
 
 ### `Default` (any 5.1 caller or 5.1 target)
@@ -77,9 +78,9 @@ and the caller, swaps the stream into PowerShell's internal
 Windows PowerShell 5.1 has no `NamedPipeConnectionInfo(string customPipeName)` constructor
 and no `-CustomPipeName`. Both editions also expose different internal
 `RemoteSessionNamedPipeServer` shapes, so the module embeds a reflection-only 5.1-specific
-helper.
+helper alongside the 7.1+ one. The target compiles only the helper matching its edition.
 
-The helper:
+For a 5.1 target, the 5.1 helper:
 
 1. sets `RemoteSessionNamedPipeServer.IPCNamedPipeServerEnabled = false`;
 2. reads the pipe name from the existing default `IPCNamedPipeServer` and disposes it;
@@ -96,8 +97,9 @@ records `LocalPSSessionConnectionMode = 'Default'` and
 
 The default AppDomain pipe name is mandatory. A custom AppDomain name / custom pipe name
 connected but did not complete the 5.1 PSRP handshake, while the default name did. A 7.1+
-target uses the same default-clone helper when the caller is 5.1, because that caller can
-only use the process-id constructor.
+target uses its own `StartDefault` path when the caller is 5.1, because that caller can
+only use the process-id constructor. That path performs the same replace-and-ACL operation
+but swaps the 7.1+ `<Stream>k__BackingField`.
 
 ## Relevant API history
 
@@ -125,14 +127,34 @@ only use the process-id constructor.
   pipe handle with an unauthorized-operation error; it is not a substitute for creating
   the pipe with the desired DACL.
 
-## Scheduled-task bootstrap
+## Bootstrap delivery
 
-Task Scheduler rejects long action arguments with `0x800700CE` (the raw/encoded bootstrap
-reached 41-65K characters once the C# helper was embedded). The scheduled-task path
-therefore passes a small `-Command` argument containing a gzip-compressed, base64-encoded
-bootstrap (about 6.4K for both 5.1 and 7.6 targets). The target decompresses it with the
-in-box `System.IO.Compression` classes and invokes it as a script block. The direct and
-`CreateProcessWithLogonW` paths still deliver the bootstrap on standard input.
+Every launch path uses the same delivery mechanism. The target command line contains a
+short reader stub and the bootstrap pipe name; it never contains the script. The caller
+writes a small `key=value` header followed by the static bootstrap to the bootstrap pipe:
+
+```text
+PSLocalSessionBootstrap/1
+PipeName=...
+ControlPipeName=...
+CallerSid=...
+ConnectTimeoutSeconds=...
+CallerIsDesktop=0|1
+
+[CmdletBinding()]
+param(...)
+...
+```
+
+The reader stub connects to the pipe, parses the header, and invokes the static script with
+the header values as parameters. The script is about 25 KB, including both C# helpers; the
+reader command is under 750 characters.
+
+This keeps the command line under `CreateProcessWithLogonW`'s 1024-character limit and well
+under Task Scheduler's action-argument limit (`0x800700CE`). It also avoids writing the
+bootstrap to a shared temporary file and avoids relying on the target account being able
+to read the caller's module directory. The bootstrap pipe uses the same caller/target-only
+DACL as the control and session pipes.
 
 ## If support is extended further
 
