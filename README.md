@@ -162,7 +162,9 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
   the UAC credential prompt where available, or pre-provision a privileged task/service.
 - `-RunLevel Highest` only has an effect when the caller uses the scheduled-task path.
   The non-elevated interactive path inherits the target's logon token.
-- No reconnect after a session is disconnected; create a new session instead.
+- No reconnect after the pipe to the target process breaks or the target exits; create a
+  new session instead. `Disconnect-PSSession` is not supported for the `NamedPipe`
+  transport.
 - The target process must allow `Add-Type`; the bootstrap compiles a small C# helper
   in-process. Constrained Language Mode, AppLocker/WDAC, and execution policy can block
   that. `-ExecutionPolicy Bypass` is passed, but Group Policy `AllSigned`/`Restricted`
