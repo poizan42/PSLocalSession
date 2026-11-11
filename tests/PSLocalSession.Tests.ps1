@@ -2,6 +2,13 @@ $modulePath = Join-Path $PSScriptRoot '..\PSLocalSession.psd1'
 Import-Module $modulePath -Force
 
 BeforeAll {
+    function Test-PSLocalSessionTestHostElevated {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity.User.Value -eq 'S-1-5-18') { return $true }
+        return [System.Security.Principal.WindowsPrincipal]::new($identity).IsInRole(
+            [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+
     function Test-PSLocalSessionProcessRunning {
         param([int]$ProcessId)
         return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
@@ -30,6 +37,12 @@ Describe 'Module surface' {
         $commands = @(Get-Command -Module PSLocalSession)
         $commands.Name | Should -Contain 'New-LocalPSSession'
         $commands.Count | Should -Be 1
+    }
+
+    It 'uses -Identity for passwordless accounts, not a -ServiceAccount argument' {
+        $parameters = (Get-Command New-LocalPSSession).Parameters.Keys
+        $parameters | Should -Contain 'Identity'
+        $parameters | Should -Not -Contain 'ServiceAccount'
     }
 }
 
@@ -135,6 +148,55 @@ Describe 'User resolution' {
 
             $resolved = Resolve-PSLocalSessionUser -UserName ".\$($localUser.Name)"
             $resolved.Sid.Value | Should -Be $localUser.SID.Value
+        }
+    }
+}
+
+Describe 'Built-in identity resolution' {
+    InModuleScope PSLocalSession {
+        It 'accepts canonical names, aliases, and raw SIDs' {
+            $cases = @{
+                'NT AUTHORITY\SYSTEM'          = 'S-1-5-18'
+                'SYSTEM'                       = 'S-1-5-18'
+                'LocalSystem'                  = 'S-1-5-18'
+                'S-1-5-18'                     = 'S-1-5-18'
+                'NT AUTHORITY\LOCAL SERVICE'   = 'S-1-5-19'
+                'LocalService'                 = 'S-1-5-19'
+                'S-1-5-19'                     = 'S-1-5-19'
+                'NT AUTHORITY\NETWORK SERVICE' = 'S-1-5-20'
+                'NetworkService'               = 'S-1-5-20'
+                'S-1-5-20'                     = 'S-1-5-20'
+            }
+
+            foreach ($case in $cases.GetEnumerator()) {
+                $resolved = Resolve-PSLocalSessionBuiltInIdentity -Identity $case.Key
+                $resolved.Sid.Value | Should -Be $case.Value
+            }
+        }
+
+        It 'rejects an ordinary account and points at -Credential' {
+            { Resolve-PSLocalSessionBuiltInIdentity -Identity '.\PSLocalSessionNoSuchAccount' } |
+                Should -Throw -ExpectedMessage '*not a built-in passwordless account*Use -Credential*'
+        }
+
+        It 'rejects virtual accounts that Task Scheduler cannot use as a principal' {
+            { Resolve-PSLocalSessionBuiltInIdentity -Identity 'NT SERVICE\foo' } |
+                Should -Throw -ExpectedMessage '*NT SERVICE virtual account*'
+            { Resolve-PSLocalSessionBuiltInIdentity -Identity 'NT TASK\foo' } |
+                Should -Throw -ExpectedMessage '*NT TASK virtual account*'
+            { Resolve-PSLocalSessionBuiltInIdentity -Identity 'IIS APPPOOL\DefaultAppPool' } |
+                Should -Throw -ExpectedMessage '*virtual account*not supported*'
+        }
+
+        It 'builds a ServiceAccount task principal without a password' {
+            foreach ($identity in 'NT AUTHORITY\SYSTEM',
+                                  'NT AUTHORITY\LOCAL SERVICE',
+                                  'NT AUTHORITY\NETWORK SERVICE') {
+                $principal = New-PSLocalSessionTaskPrincipal -TargetUserName $identity `
+                    -LogonType ServiceAccount -RunLevel Limited
+                $principal.LogonType | Should -Be 'ServiceAccount'
+                $principal.RunLevel | Should -Be 'Limited'
+            }
         }
     }
 }
@@ -291,6 +353,21 @@ Describe 'Error handling' {
             Should -Throw -ExpectedMessage '*Cannot resolve the account*'
     }
 
+    It 'rejects an ordinary account passed as -Identity' {
+        { New-LocalPSSession -Identity '.\PSLocalSessionNoSuchAccount12345' -NoProfile } |
+            Should -Throw -ExpectedMessage '*not a built-in passwordless account*'
+    }
+
+    It 'requires an elevated caller for a built-in identity' {
+        if (Test-PSLocalSessionTestHostElevated) {
+            Set-ItResult -Skipped -Because 'the test host is already elevated'
+            return
+        }
+
+        { New-LocalPSSession -Identity 'NT AUTHORITY\SYSTEM' -NoProfile } |
+            Should -Throw -ExpectedMessage '*require an elevated caller*'
+    }
+
     It 'rejects a missing PowerShell path' {
         { New-LocalPSSession -CurrentUser -PowerShellPath 'C:\PSLocalSession\no-such-pwsh.exe' } |
             Should -Throw
@@ -298,6 +375,62 @@ Describe 'Error handling' {
 
     It 'rejects an invalid run level' {
         { New-LocalPSSession -CurrentUser -RunLevel 'Bogus' } | Should -Throw
+    }
+}
+
+Describe 'Built-in service account sessions' -Tag 'ServiceAccount' {
+    It 'runs the target as <Identity>' -ForEach @(
+        @{ Identity = 'NT AUTHORITY\SYSTEM'; Sid = 'S-1-5-18' }
+        @{ Identity = 'NT AUTHORITY\LOCAL SERVICE'; Sid = 'S-1-5-19' }
+        @{ Identity = 'NT AUTHORITY\NETWORK SERVICE'; Sid = 'S-1-5-20' }
+    ) {
+        if (-not (Test-PSLocalSessionTestHostElevated)) {
+            Set-ItResult -Skipped -Because 'built-in service account sessions require an elevated caller'
+            return
+        }
+
+        $session = $null
+        $targetPid = 0
+        try {
+            $session = New-LocalPSSession -Identity $Identity -NoProfile -StartupTimeoutSeconds 60
+            $targetPid = [int]$session.LocalPSSessionProcessId
+
+            $session.LocalPSSessionUserName | Should -Be $Identity
+            $session.LocalPSSessionLaunchMethod | Should -Be 'ScheduledTask'
+            $session.LocalPSSessionRunLevel | Should -BeIn @('Highest', 'Limited')
+
+            $info = Invoke-Command -Session $session -ScriptBlock {
+                $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                $tempDirectory = [System.IO.Path]::GetTempPath()
+                $probe = Join-Path $tempDirectory (
+                    'PSLocalSession-probe-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+                try {
+                    'probe' | Set-Content -LiteralPath $probe -ErrorAction Stop
+                    $tempWritable = (Get-Content -LiteralPath $probe -Raw).Trim() -eq 'probe'
+                }
+                finally {
+                    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+                }
+
+                [pscustomobject]@{
+                    Sid          = $identity.User.Value
+                    ProcessId    = $PID
+                    Temp         = $tempDirectory
+                    TempWritable = $tempWritable
+                }
+            }
+
+            $info.Sid | Should -Be $Sid
+            $info.ProcessId | Should -Be $targetPid
+            $info.TempWritable | Should -BeTrue -Because "the target's TEMP is '$($info.Temp)'"
+        }
+        finally {
+            if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+            if ($targetPid) {
+                [void](Wait-PSLocalSessionProcessExit -ProcessId $targetPid -TimeoutSeconds 30)
+                Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 

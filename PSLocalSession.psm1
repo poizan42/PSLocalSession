@@ -73,6 +73,65 @@ function Resolve-PSLocalSessionUser {
     }
 }
 
+function Resolve-PSLocalSessionBuiltInIdentity {
+    <#  .SYNOPSIS Resolves a built-in passwordless account to its canonical name and SID.
+
+        Task Scheduler can run a task directly as SYSTEM, LOCAL SERVICE, or NETWORK SERVICE
+        with a ServiceAccount principal. Those accounts have no password, so -Credential
+        cannot carry them. Other passwordless account types are not supported. #>
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Identity
+    )
+
+    $value = $Identity.Trim()
+    $key = $value.ToUpperInvariant()
+    $accounts = @{
+        'S-1-5-18'                     = 'NT AUTHORITY\SYSTEM'
+        'SYSTEM'                       = 'NT AUTHORITY\SYSTEM'
+        'LOCALSYSTEM'                  = 'NT AUTHORITY\SYSTEM'
+        'NT AUTHORITY\SYSTEM'          = 'NT AUTHORITY\SYSTEM'
+        'NT AUTHORITY\LOCALSYSTEM'     = 'NT AUTHORITY\SYSTEM'
+        'S-1-5-19'                     = 'NT AUTHORITY\LOCAL SERVICE'
+        'LOCAL SERVICE'                = 'NT AUTHORITY\LOCAL SERVICE'
+        'LOCALSERVICE'                 = 'NT AUTHORITY\LOCAL SERVICE'
+        'NT AUTHORITY\LOCAL SERVICE'   = 'NT AUTHORITY\LOCAL SERVICE'
+        'NT AUTHORITY\LOCALSERVICE'    = 'NT AUTHORITY\LOCAL SERVICE'
+        'S-1-5-20'                     = 'NT AUTHORITY\NETWORK SERVICE'
+        'NETWORK SERVICE'              = 'NT AUTHORITY\NETWORK SERVICE'
+        'NETWORKSERVICE'               = 'NT AUTHORITY\NETWORK SERVICE'
+        'NT AUTHORITY\NETWORK SERVICE' = 'NT AUTHORITY\NETWORK SERVICE'
+        'NT AUTHORITY\NETWORKSERVICE'  = 'NT AUTHORITY\NETWORK SERVICE'
+    }
+
+    if ($accounts.ContainsKey($key)) {
+        # Do not use the supplied spelling: Task Scheduler and the pipe ACLs use the
+        # canonical account name and SID.
+        return Resolve-PSLocalSessionUser -UserName $accounts[$key]
+    }
+
+    if ($key -like 'NT SERVICE\*') {
+        throw (("'{0}' is an NT SERVICE virtual account. Task Scheduler cannot run a task " +
+                "as it; create a service that runs as it instead.") -f $Identity)
+    }
+    if ($key -like 'NT TASK\*') {
+        throw (("'{0}' is an NT TASK virtual account. It can only be used by the scheduled " +
+                "task that owns it.") -f $Identity)
+    }
+    if ($key -like 'IIS APPPOOL\*' -or $key -like 'NT VIRTUAL MACHINE\*' -or
+        $key -like 'WINDOW MANAGER\*' -or $key -like 'FONT DRIVER HOST\*') {
+        throw (("'{0}' is a Windows virtual account. Virtual accounts are not supported by " +
+                "New-LocalPSSession.") -f $Identity)
+    }
+
+    throw (("'{0}' is not a built-in passwordless account. Use -Credential for an account " +
+            "with a password. -Identity accepts NT AUTHORITY\SYSTEM, " +
+            "NT AUTHORITY\LOCAL SERVICE, or NT AUTHORITY\NETWORK SERVICE.") -f $Identity)
+}
+
 function Get-PSLocalSessionPowerShellPath {
     <# .SYNOPSIS Locates the PowerShell executable used to host the target session. #>
     [OutputType([string])]
@@ -422,7 +481,7 @@ function Get-PSLocalSessionLogonErrorHint {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.Exception]$Exception,
-        [Parameter(Mandatory)][ValidateSet('Batch', 'Interactive')][string]$LogonPath
+        [Parameter(Mandatory)][ValidateSet('Batch', 'Interactive', 'Service')][string]$LogonPath
     )
 
     $inner = $Exception
@@ -442,6 +501,11 @@ function Get-PSLocalSessionLogonErrorHint {
                 return ("The account lacks the 'Log on as a batch job' right (or is denied it). " +
                         "Grant it in Local Security Policy > User Rights Assignment, or run " +
                         "New-LocalPSSession from a non-elevated prompt to use an interactive logon instead.")
+            }
+            if ($LogonPath -eq 'Service') {
+                return ("The account lacks the 'Log on as a service' right (or is denied it). " +
+                        "Built-in service accounts normally have it; check Local Security Policy > " +
+                        "User Rights Assignment if it was removed.")
             }
             return ("The account is denied 'Log on locally', which this path requires. Run " +
                     "New-LocalPSSession from an elevated prompt so the scheduled-task path can be " +
@@ -478,13 +542,16 @@ function Get-PSLocalSessionTaskResultHint {
         0x00041302 { return 'the task was disabled' }
         0x00041303 { return 'the task has never run' }
         0x00041306 { return 'the task was terminated' }
-        0x8004130F { return 'no account information could be found; the stored credential did not take' }
+        0x8004130F { return 'no account information could be found; the task logon information did not take' }
         0x80070005 { return 'access denied' }
-        0x80070569 { return "the account lacks the 'Log on as a batch job' right (or is explicitly denied it)" }
+        0x80070569 {
+            return ("the account lacks the requested logon right (batch for -Credential, " +
+                    "service for -Identity) or is explicitly denied it")
+        }
         0x8007052E { return 'the user name or password is incorrect' }
         0x80070532 { return "the account's password has expired" }
         0x80070533 { return 'the account is disabled' }
-        0x800704DD { return 'the account is not logged on; the task needs a stored password' }
+        0x800704DD { return 'the task account is not logged on; check the logon type and stored credentials' }
         0x80070775 { return 'the account is locked out' }
         default { return $null }
     }
@@ -621,13 +688,34 @@ function Test-PSLocalSessionAccessDeniedError {
     return ($inner.Message -match 'Access is denied|Access denied')
 }
 
+function New-PSLocalSessionTaskPrincipal {
+    <#  .SYNOPSIS Builds a scheduled-task principal that stores no password.
+
+        ServiceAccount is Task Scheduler's logon type for built-in service accounts;
+        Interactive exists for the test-only interactive-token path. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TargetUserName,
+        [Parameter(Mandatory)]
+        [ValidateSet('Interactive', 'ServiceAccount')]
+        [string]$LogonType,
+        [Parameter(Mandatory)]
+        [ValidateSet('Highest', 'Limited')]
+        [string]$RunLevel
+    )
+
+    return New-ScheduledTaskPrincipal -UserId $TargetUserName -LogonType $LogonType `
+        -RunLevel $RunLevel -ErrorAction Stop
+}
+
 function Start-PSLocalSessionScheduledTask {
     <#  .SYNOPSIS Starts the target PowerShell through Task Scheduler.
 
         The production path uses a stored password and therefore a BATCH logon. The
         -InteractiveToken switch exists so tests can exercise the task plumbing without a
         second account's password; it registers the task with an interactive-logon
-        principal instead. #>
+        principal instead. -Passwordless registers a ServiceAccount principal for a
+        built-in passwordless account and never stores a password. #>
     [OutputType([hashtable])]
     [CmdletBinding(DefaultParameterSetName = 'Password')]
     param(
@@ -637,6 +725,7 @@ function Start-PSLocalSessionScheduledTask {
         [Parameter(Mandatory, ParameterSetName = 'Password')][pscredential]$Credential,
         [Parameter(Mandatory)][string]$TargetUserName,
         [Parameter(Mandatory, ParameterSetName = 'Interactive')][switch]$InteractiveToken,
+        [Parameter(Mandatory, ParameterSetName = 'Passwordless')][switch]$Passwordless,
         [ValidateSet('Highest', 'Limited')][string]$RunLevel = 'Highest',
         [switch]$NoProfile
     )
@@ -656,7 +745,13 @@ function Start-PSLocalSessionScheduledTask {
         -WorkingDirectory ([System.IO.Path]::Combine($env:SystemRoot, 'System32'))
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -ExecutionTimeLimit (New-TimeSpan -Days 1)
-    $task = @{ TaskName = $taskName; TaskPath = $script:TaskPath; Registered = $false; RunLevel = $null }
+    $task = @{
+        TaskName         = $taskName
+        TaskPath         = $script:TaskPath
+        Registered       = $false
+        RunLevel         = $null
+        StoresCredential = $PSCmdlet.ParameterSetName -eq 'Password'
+    }
 
     $password = $null
     try {
@@ -664,8 +759,17 @@ function Start-PSLocalSessionScheduledTask {
         foreach ($level in $levels) {
             try {
                 if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
-                    $principal = New-ScheduledTaskPrincipal -UserId $TargetUserName `
+                    $principal = New-PSLocalSessionTaskPrincipal -TargetUserName $TargetUserName `
                         -LogonType Interactive -RunLevel $level
+                    $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
+                        -Action $action -Settings $settings -Principal $principal `
+                        -Force -ErrorAction Stop
+                }
+                elseif ($PSCmdlet.ParameterSetName -eq 'Passwordless') {
+                    # ServiceAccount tells Task Scheduler to use the account's service logon
+                    # without a stored password. There is no -User/-Password pair here.
+                    $principal = New-PSLocalSessionTaskPrincipal -TargetUserName $TargetUserName `
+                        -LogonType ServiceAccount -RunLevel $level
                     $null = Register-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath `
                         -Action $action -Settings $settings -Principal $principal `
                         -Force -ErrorAction Stop
@@ -692,7 +796,12 @@ function Start-PSLocalSessionScheduledTask {
         }
     }
     catch {
-        $hint = Get-PSLocalSessionLogonErrorHint -Exception $_.Exception -LogonPath 'Batch'
+        $logonPath = switch ($PSCmdlet.ParameterSetName) {
+            'Interactive' { 'Interactive' }
+            'Passwordless' { 'Service' }
+            default { 'Batch' }
+        }
+        $hint = Get-PSLocalSessionLogonErrorHint -Exception $_.Exception -LogonPath $logonPath
         if ($task.Registered) {
             try {
                 Stop-ScheduledTask -TaskName $taskName -TaskPath $script:TaskPath -ErrorAction SilentlyContinue
@@ -729,10 +838,16 @@ function Unregister-PSLocalSessionScheduledTask {
         $Task.Registered = $false
     }
     catch {
+        $credentialNote = if ($Task.StoresCredential) {
+            ' It still holds the stored credential.'
+        }
+        else {
+            ''
+        }
         Write-Warning ("The session is running, but its scheduled task '{1}' at '{0}' could not be " +
-            "unregistered: {2} It still holds the stored credential. Remove it with: " +
+            "unregistered: {2}{3} Remove it with: " +
             "Unregister-ScheduledTask -TaskName '{1}' -TaskPath '{0}' -Confirm:`$false" -f
-            $Task.TaskPath, $Task.TaskName, $_.Exception.Message)
+            $Task.TaskPath, $Task.TaskName, $_.Exception.Message, $credentialNote)
     }
 }
 
@@ -939,11 +1054,19 @@ function New-LocalPSSession {
 
         The launch method is selected automatically:
           - -CurrentUser      starts the target PowerShell directly.
+          - -Identity         uses a temporary scheduled task with a service-account
+                              logon; the caller must be elevated or LocalSystem.
           - elevated caller   uses a temporary scheduled task (batch logon).
           - non-elevated      uses CreateProcessWithLogonW (interactive logon).
 
     .PARAMETER Credential
         Credentials for the account that the session should run as.
+
+    .PARAMETER Identity
+        Runs the target as a built-in passwordless account: NT AUTHORITY\SYSTEM,
+        NT AUTHORITY\LOCAL SERVICE, or NT AUTHORITY\NETWORK SERVICE. Task Scheduler is the
+        only route to these accounts, so the caller must be elevated (or LocalSystem).
+        Use -Credential for an account with a password.
 
     .PARAMETER CurrentUser
         Starts a session as the current user. Intended for diagnostics and testing.
@@ -962,9 +1085,9 @@ function New-LocalPSSession {
 
     .PARAMETER RunLevel
         Requested task run level: Highest (default) or Limited. It applies to the temporary
-        scheduled task used for an elevated caller. Highest falls back to Limited when the
-        caller cannot create a highest-privilege task. The non-elevated interactive path
-        inherits the target account's logon token instead.
+        scheduled task used for -Identity or an elevated caller with -Credential. Highest
+        falls back to Limited when the caller cannot create a highest-privilege task. The
+        non-elevated interactive path inherits the target account's logon token instead.
 
     .PARAMETER StartupTimeoutSeconds
         How long to wait for the target process to start listening. Defaults to 30.
@@ -979,6 +1102,12 @@ function New-LocalPSSession {
         $session = New-LocalPSSession -CurrentUser -NoProfile
         Invoke-Command -Session $session -ScriptBlock { $PID }
         Remove-PSSession -Session $session
+
+    .EXAMPLE
+        # From an elevated PowerShell
+        $session = New-LocalPSSession -Identity 'NT AUTHORITY\SYSTEM' -NoProfile
+        Invoke-Command -Session $session -ScriptBlock { whoami }
+        Remove-PSSession -Session $session
     #>
     [CmdletBinding(DefaultParameterSetName = 'Credential')]
     [OutputType([System.Management.Automation.Runspaces.PSSession])]
@@ -986,6 +1115,10 @@ function New-LocalPSSession {
         [Parameter(Mandatory, ParameterSetName = 'Credential', Position = 0)]
         [ValidateNotNull()]
         [pscredential]$Credential,
+
+        [Parameter(Mandatory, ParameterSetName = 'Identity')]
+        [ValidateNotNullOrEmpty()]
+        [string]$Identity,
 
         [Parameter(Mandatory, ParameterSetName = 'CurrentUser')]
         [switch]$CurrentUser,
@@ -1028,6 +1161,7 @@ function New-LocalPSSession {
     $callerIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $callerSid = $callerIdentity.User
 
+    $passwordlessLaunch = $false
     if ($PSCmdlet.ParameterSetName -eq 'CurrentUser') {
         # The token already carries the answer; do not depend on name resolution here.
         $target = [pscustomobject]@{
@@ -1036,6 +1170,17 @@ function New-LocalPSSession {
             IsCurrentUser = $true
         }
         $launchMethod = 'CurrentUser'
+    }
+    elseif ($PSCmdlet.ParameterSetName -eq 'Identity') {
+        # Validate the account before the elevation check so an ordinary account gets the
+        # useful "use -Credential" message even from a non-elevated caller.
+        $target = Resolve-PSLocalSessionBuiltInIdentity -Identity $Identity
+        if (-not (Test-PSLocalSessionElevated)) {
+            throw ('Built-in service account sessions require an elevated caller or ' +
+                   'LocalSystem. Run New-LocalPSSession from an elevated PowerShell.')
+        }
+        $passwordlessLaunch = $true
+        $launchMethod = 'ScheduledTask'
     }
     else {
         $target = Resolve-PSLocalSessionUser -UserName $Credential.UserName
@@ -1104,10 +1249,21 @@ function New-LocalPSSession {
         $connectionTask = $controlPipe.WaitForConnectionAsync()
 
         if ($launchMethod -eq 'ScheduledTask') {
-            $task = Start-PSLocalSessionScheduledTask -PowerShellPath $pwshPath `
-                -BootstrapScriptPath $bootstrapScriptPath `
-                -BootstrapArguments $bootstrapArguments -Credential $Credential `
-                -TargetUserName $target.UserName -RunLevel $RunLevel -NoProfile:$NoProfile
+            $taskParameters = @{
+                PowerShellPath       = $pwshPath
+                BootstrapScriptPath  = $bootstrapScriptPath
+                BootstrapArguments   = $bootstrapArguments
+                TargetUserName       = $target.UserName
+                RunLevel             = $RunLevel
+                NoProfile            = $NoProfile
+            }
+            if ($passwordlessLaunch) {
+                $taskParameters['Passwordless'] = $true
+            }
+            else {
+                $taskParameters['Credential'] = $Credential
+            }
+            $task = Start-PSLocalSessionScheduledTask @taskParameters
 
             $taskName = $task.TaskName
             $taskPath = $task.TaskPath

@@ -4,7 +4,7 @@
     GUID                 = '355975f9-7008-43f4-ad07-d3e0486b0142'
     Author               = 'Kasper Fabæch Brandt'
     Copyright            = '(c) 2026 Kasper Fabæch Brandt'
-    Description          = 'Starts PowerShell as another local user and returns a PSSession connected over a local named pipe.'
+    Description          = 'Starts PowerShell as another local user or built-in service account and returns a PSSession connected over a local named pipe.'
     PowerShellVersion    = '5.1'
     CompatiblePSEditions = @('Desktop', 'Core')
     FileList             = @(

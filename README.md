@@ -13,6 +13,14 @@ Enter-PSSession -Session $session
 Remove-PSSession -Session $session
 ```
 
+Built-in passwordless accounts use `-Identity` from an elevated PowerShell:
+
+```powershell
+$system = New-LocalPSSession -Identity 'NT AUTHORITY\SYSTEM' -NoProfile
+Invoke-Command -Session $system -ScriptBlock { whoami }
+Remove-PSSession -Session $system
+```
+
 The returned object is a real `PSSession` (`Transport = NamedPipe` on 7.1+; 5.1 has no
 `Transport` property). It appears in `Get-PSSession`, works with `Invoke-Command`,
 `Enter-PSSession`, `Copy-Item -ToSession`, and the other session cmdlets, and is removed
@@ -23,21 +31,28 @@ with `Remove-PSSession`.
 - Windows.
 - Windows PowerShell 5.1 or PowerShell 7.1+, both in the calling session and at the
   target executable. PowerShell 7.0/6.2 are not supported.
-- A target account with a password (`-Credential`). Passwordless accounts (gMSAs,
-  virtual/service accounts) are not supported yet. The user name can be `DOMAIN\user`,
-  `MACHINE\user`, a UPN, or `.\user` to force a local account.
+- For `-Credential`, a target account with a password. The user name can be
+  `DOMAIN\user`, `MACHINE\user`, a UPN, or `.\user` to force a local account.
+- For `-Identity`, one of the built-in passwordless service accounts:
+  `NT AUTHORITY\SYSTEM`, `NT AUTHORITY\LOCAL SERVICE`, or
+  `NT AUTHORITY\NETWORK SERVICE`. `-Identity` always requires an elevated caller (or
+  `LocalSystem`). gMSAs, `NT SERVICE\*`, `NT TASK\*`, and Windows virtual accounts such
+  as `IIS APPPOOL\*` are not supported.
 - The target must be able to read and execute the chosen `pwsh.exe`/`powershell.exe`.
-- For `-Credential` sessions, the target account must be able to read the module's
+- For a different target account, the target must be able to read the module's
   `PSLocalSession.Bootstrap.ps1` and pipe-server `.cs` files. A module under the caller's
   profile is staged directly; for other paths the module checks the target's effective
   read/traverse rights with `GetEffectiveRightsFromAclW`. If needed, it copies those static
   files to `%ProgramData%\PSLocalSession-<guid>\` with a caller/target-only DACL.
 - Logon rights depend on the launch path:
-  - **Elevated caller** starts the target through a temporary scheduled task, which is
-    a *batch* logon. The account needs **Log on as a batch job**.
-  - **Non-elevated caller** uses `CreateProcessWithLogonW`, which is an *interactive*
-    logon. The account needs **Log on locally**, and the Secondary Logon service must be
-    enabled.
+  - **`-Identity`** starts the target through a temporary scheduled task with a
+    *service-account* logon (`ServiceAccount`). No password is stored. The caller must be
+    elevated or `LocalSystem`.
+  - **Elevated caller with `-Credential`** starts the target through a temporary scheduled
+    task, which is a *batch* logon. The account needs **Log on as a batch job**.
+  - **Non-elevated caller with `-Credential`** uses `CreateProcessWithLogonW`, which is an
+    *interactive* logon. The account needs **Log on locally**, and the Secondary Logon
+    service must be enabled.
 
 `-CurrentUser` is a diagnostic/testing mode that starts a session as the caller without
 using a password or a second account.
@@ -46,12 +61,13 @@ using a password or a second account.
 
 | Parameter | Meaning |
 |---|---|
-| `-Credential` | Account to run the target session as. |
+| `-Credential` | Account with a password to run the target session as. |
+| `-Identity` | Built-in passwordless account: `NT AUTHORITY\SYSTEM`, `NT AUTHORITY\LOCAL SERVICE`, or `NT AUTHORITY\NETWORK SERVICE`. Requires an elevated caller or `LocalSystem`. |
 | `-CurrentUser` | Run as the current user instead of a supplied credential. |
 | `-Name` | Friendly name for the returned `PSSession`. |
 | `-NoProfile` | Start the target with `-NoProfile`. |
 | `-PowerShellPath` | Target executable. Defaults to `$PSHOME\pwsh.exe` on 7.1+, or `$PSHOME\powershell.exe` on 5.1. |
-| `-RunLevel` | `Highest` (default) or `Limited` for the temporary scheduled task. Applies only when an elevated caller uses the scheduled-task path. |
+| `-RunLevel` | `Highest` (default) or `Limited` for the temporary scheduled task. Applies to `-Identity` and to `-Credential` when the caller is elevated. |
 | `-StartupTimeoutSeconds` | How long to wait for the target to become ready (default 30). |
 
 The returned session also carries diagnostic note properties:
@@ -73,9 +89,10 @@ The returned session also carries diagnostic note properties:
    directory under `%ProgramData%` with a caller/target-only DACL.
 3. A target `pwsh.exe` (7.1+) or `powershell.exe` (5.1) is started:
    - directly for `-CurrentUser`;
-   - through a temporary scheduled task for an elevated caller or `LocalSystem`
-     (batch logon), using `Highest` by default and falling back to `Limited` if the
-     caller cannot create a highest-privilege task;
+   - through a temporary scheduled task for `-Identity` (service-account logon, no stored
+     password), or for an elevated caller with `-Credential` (batch logon), using
+     `Highest` by default and falling back to `Limited` if the caller cannot create a
+     highest-privilege task;
    - through `CreateProcessWithLogonW` for a non-elevated caller (interactive logon).
 
    The command line contains `-File <bootstrap.ps1>` and the per-session arguments, never
@@ -100,6 +117,11 @@ The returned session also carries diagnostic note properties:
 
 - `-CurrentUser` inherits the caller's token exactly: an elevated caller gives an elevated
   target, and a non-elevated caller gives a limited target.
+- `-Identity` always uses the scheduled-task path with a `ServiceAccount` principal. It
+  requires an elevated caller or `LocalSystem`; a non-elevated caller is rejected before
+  any process is started. The built-in account's own service token is used, and no
+  password is stored. The task uses `Highest` by default with the same `Limited` fallback
+  as the `-Credential` scheduled-task path.
 - `-Credential` with an elevated caller or `LocalSystem` uses the scheduled-task path. The
   task is registered with `Highest` by default; if the caller is not allowed to create a
   highest-privilege task, it falls back to `Limited`. Use `-RunLevel Limited` to request
@@ -144,11 +166,15 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
   DACL and is removed after the target starts. Other users cannot read or modify it.
 - The non-elevated path never puts the password on a command line; `ProcessStartInfo`
   carries it as a `SecureString`.
-- The elevated path must give Task Scheduler a plaintext password for the duration of
-  task registration. The task is unregistered as soon as the target process reports
-  readiness, and stale `session-*` tasks older than ten minutes are swept before the next
-  scheduled-task launch. If the caller is killed at exactly the wrong moment, a task can
-  remain and hold the stored credential; the warning/cleanup path reports its name.
+- `-Identity` stores no password. Task Scheduler registers a `ServiceAccount` principal,
+  starts the target, and the task definition is unregistered as soon as the target
+  reports readiness, just like the `-Credential` scheduled-task path.
+- The `-Credential` scheduled-task path must give Task Scheduler a plaintext password for
+  the duration of task registration. The task is unregistered as soon as the target
+  process reports readiness, and stale `session-*` tasks older than ten minutes are swept
+  before the next scheduled-task launch. If the caller is killed at exactly the wrong
+  moment, a task can remain and hold the stored credential; the warning/cleanup path
+  reports its name.
 - The target process is launched with `-NonInteractive`. Target profiles still load unless
   `-NoProfile` is used, but profile prompts fail rather than consume startup input.
 
@@ -156,12 +182,17 @@ Windows PowerShell 5.1 and PowerShell 7.1+.
 
 - Windows only; Windows PowerShell 5.1 or PowerShell 7.1+. PowerShell 7.0/6.2 are not
   supported; see `docs/compatibility.md`.
-- No gMSA, `NT SERVICE\*`, virtual, or other passwordless accounts yet.
+- Built-in `SYSTEM`, `LOCAL SERVICE`, and `NETWORK SERVICE` are supported through
+  `-Identity`. gMSAs, `NT SERVICE\*`, `NT TASK\*`, and virtual accounts such as
+  `IIS APPPOOL\*` are not supported yet.
+- `-Identity` requires an elevated caller or `LocalSystem`; there is no non-elevated
+  fallback for a passwordless account.
 - A non-elevated, non-interactive caller cannot silently obtain a full administrator token
   for an ordinary local administrator account. Run the caller elevated/`LocalSystem`, use
   the UAC credential prompt where available, or pre-provision a privileged task/service.
-- `-RunLevel Highest` only has an effect when the caller uses the scheduled-task path.
-  The non-elevated interactive path inherits the target's logon token.
+- `-RunLevel Highest` only has an effect when the caller uses the scheduled-task path
+  (`-Identity`, or `-Credential` from an elevated caller). The non-elevated interactive
+  path inherits the target's logon token.
 - No reconnect after the pipe to the target process breaks or the target exits; create a
   new session instead. `Disconnect-PSSession` is not supported for the `NamedPipe`
   transport.
@@ -187,7 +218,10 @@ The suite covers:
 - current-user sessions end to end (real process, real pipe, real PSSession);
 - a Windows PowerShell 5.1 target through the default IPC pipe clone;
 - concurrent sessions and process cleanup;
+- built-in identity resolution and `ServiceAccount` task principals;
 - the scheduled-task plumbing, including static bootstrap-file delivery;
+- end-to-end sessions for `SYSTEM`, `LOCAL SERVICE`, and `NETWORK SERVICE` when the test
+  host is elevated;
 - basic error cases.
 
 The scheduled-task test needs an interactive logged-on session and permission to
@@ -203,6 +237,8 @@ windows:
 ```powershell
 ./tools/Test-PowerShell51.ps1
 ./tools/Test-LocalPSSessionAnotherUser.ps1
+# Run from an elevated PowerShell; tests all three built-in accounts.
+./tools/Test-BuiltInServiceAccounts.ps1
 ```
 
 ### Verification notes
@@ -231,6 +267,17 @@ windows:
   static bootstrap-file delivery, unregister-while-running, and disconnect cleanup). The
   stored-password / batch-logon variant shares that plumbing; the password-registration
   error path was also exercised.
+- Built-in `SYSTEM`, `LOCAL SERVICE`, and `NETWORK SERVICE` sessions were exercised end to
+  end from an elevated 7.6.9 caller against 7.6.9 and Windows PowerShell 5.1 targets, from
+  a Windows PowerShell 5.1 caller against 5.1 and 7.6.9 targets, and from a `LocalSystem`
+  caller against a 7.6.9 target. Every target reported its expected SID, `ScheduledTask`
+  launch with the `Highest` run level, a writable TEMP, and exited when the session was
+  removed. The 7.1+ caller/target and `LocalSystem` pairs used `Custom`; any pair involving
+  a 5.1 caller or target used `Default`. An explicit `-RunLevel Limited` session as SYSTEM
+  also reported `Limited`.
+- The elevated full Pester suite passed 33 tests with 0 failures and 1 deliberate skip
+  (the non-elevated-only rejection test). The non-elevated full suite passed 31 tests with
+  the three built-in end-to-end tests skipped.
 
 ## Layout
 
@@ -245,6 +292,7 @@ PSLocalSession.AccessCheck.cs       caller-side effective-rights check
 tests/PSLocalSession.Tests.ps1      Pester 6 suite
 tools/Test-PowerShell51.ps1         manual 5.1 caller/target check
 tools/Test-LocalPSSessionAnotherUser.ps1
+tools/Test-BuiltInServiceAccounts.ps1  manual elevated built-in account check
 ```
 
 ## Author and license

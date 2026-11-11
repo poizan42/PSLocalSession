@@ -65,6 +65,16 @@ was also exercised from an elevated caller against a temporary administrator acc
 the default `Highest` run level; the target reported High integrity. The task and staging
 copy were removed afterwards.
 
+Built-in `SYSTEM`, `LOCAL SERVICE`, and `NETWORK SERVICE` sessions use Task Scheduler's
+`ServiceAccount` logon type and require an elevated caller or `LocalSystem`. On 2026-11-11
+all three were exercised end to end from an elevated 7.6.9 caller against 7.6.9 and 5.1
+targets, from a 5.1 caller against 5.1 and 7.6.9 targets, and from a `LocalSystem` caller
+against a 7.6.9 target. Each target reported its expected SID, `ScheduledTask` launch with
+the `Highest` run level, and a writable TEMP. An explicit `-RunLevel Limited` session as
+SYSTEM also reported `Limited`. The 7.1+ caller/target and `LocalSystem` pairs used
+`Custom`; any pair involving a 5.1 caller or target used `Default`. The elevated Pester
+suite passed 33 tests with 1 deliberate non-elevated-only skip.
+
 ## Connection modes
 
 ### `Custom` (7.1+ caller and 7.1+ target)
@@ -148,11 +158,11 @@ never the script text:
 -CallerIsDesktop 0|1
 ```
 
-For `-CurrentUser`, the script is loaded from the module directory. For `-Credential`, a
-module under the caller profile is staged directly. For other locations, the caller checks
-the target SID's effective read access to the bootstrap and helper files, and traverse
-access to their parent directories, using `GetEffectiveRightsFromAclW`. This does not
-require a token for the target account. If the check fails for any reason (including an
+For `-CurrentUser`, the script is loaded from the module directory. For `-Credential` or
+`-Identity`, a module under the caller profile is staged directly. For other locations, the
+caller checks the target SID's effective read access to the bootstrap and helper files, and
+traverse access to their parent directories, using `GetEffectiveRightsFromAclW`. This does
+not require a token for the target account. If the check fails for any reason (including an
 unreachable domain group or an inherited deny ACE), the module treats it as no access and
 stages a copy under `%ProgramData%\PSLocalSession-<guid>` with a caller/target-only DACL.
 The caller uses the module path when the target can read it, and removes any staged copy
@@ -168,6 +178,10 @@ executed from a pipe.
 
 - `-CurrentUser` inherits the caller token. An elevated caller gives an elevated target; a
   non-elevated caller gives a limited target.
+- `-Identity` always uses Task Scheduler with a `ServiceAccount` principal and no stored
+  password. It requires an elevated caller or `LocalSystem`; a non-elevated caller is
+  rejected before a pipe or process is created. The default requested run level is
+  `Highest`, with the same `Limited` fallback as the `-Credential` scheduled-task path.
 - An elevated caller or `LocalSystem` with `-Credential` uses Task Scheduler. The default
   requested run level is `Highest`; if task registration is denied, the module retries with
   `Limited`. `-RunLevel Limited` forces the limited level.
@@ -190,3 +204,7 @@ executed from a pipe.
 2. Other Windows PowerShell 5.1 configurations - Constrained Language Mode, AppLocker/WDAC,
    or a read-only target TEMP can block the in-process `Add-Type`; the module currently
    requires the target to compile the helper.
+3. gMSAs, `NT SERVICE\*`, `NT TASK\*`, and Windows virtual accounts (`IIS APPPOOL\*`, ...)
+   need their own launch designs. gMSAs use a `Password` task principal with no password;
+   `NT SERVICE`/`NT TASK` are reached by the service/task that owns them; other virtual
+   accounts need a SYSTEM worker and `LogonUserExW` with `LOGON32_PROVIDER_VIRTUAL`.

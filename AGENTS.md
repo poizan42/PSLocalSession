@@ -17,8 +17,8 @@ pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 6.0; Invoke-Peste
 # One test / one area
 pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 6.0; Invoke-Pester ./tests -FullNameFilter '*stops the target process*' -Output Detailed"
 
-# Headless agent: skip the task-scheduler test
-pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 6.0; Invoke-Pester ./tests -ExcludeTagFilter ScheduledTask -Output Detailed"
+# Headless agent: skip the task-scheduler and built-in-account tests
+pwsh -NoProfile -Command "Import-Module Pester -MinimumVersion 6.0; Invoke-Pester ./tests -ExcludeTagFilter ScheduledTask,ServiceAccount -Output Detailed"
 
 # Manual Windows PowerShell 5.1 caller/target check
 powershell.exe -NoProfile -File ./tools/Test-PowerShell51.ps1
@@ -26,6 +26,9 @@ powershell.exe -NoProfile -File ./tools/Test-PowerShell51.ps1
 # Manual second-account test; run once elevated and once non-elevated,
 # and once from Windows PowerShell 5.1 when touching the 5.1 path
 pwsh -NoProfile -File ./tools/Test-LocalPSSessionAnotherUser.ps1
+
+# Manual built-in service-account test; run elevated (or as LocalSystem)
+pwsh -NoProfile -File ./tools/Test-BuiltInServiceAccounts.ps1
 ```
 
 The suite spawns real `pwsh`/`powershell.exe` processes and real named pipes; there are no
@@ -73,9 +76,24 @@ interactive logged-on session.
   single server instance. The current helper exists specifically to place the ACL before
   listening.
 - Launch matrix is intentional:
-  - elevated caller or `LocalSystem` -> temporary scheduled task -> batch logon;
-  - non-elevated caller -> `CreateProcessWithLogonW` -> interactive logon;
+  - `-Identity` built-in account -> temporary scheduled task -> `ServiceAccount` logon
+    (no password), elevated caller or `LocalSystem` only;
+  - elevated caller or `LocalSystem` with `-Credential` -> temporary scheduled task ->
+    batch logon;
+  - non-elevated caller with `-Credential` -> `CreateProcessWithLogonW` -> interactive
+    logon;
   - `-CurrentUser` -> direct child process.
+- The public passwordless selector is `-Identity`, matching the reference project. Do not
+  add a `-ServiceAccount` argument. Only `NT AUTHORITY\SYSTEM`,
+  `NT AUTHORITY\LOCAL SERVICE`, and `NT AUTHORITY\NETWORK SERVICE` are supported;
+  `NT SERVICE\*`, `NT TASK\*`, gMSAs, and other virtual accounts stay rejected.
+- `-Identity` resolves to the canonical built-in name/SID before the elevation check, so an
+  ordinary account gets the "use -Credential" error even from a non-elevated caller. A
+  non-elevated caller with a valid built-in identity is rejected before any pipe or
+  process is created.
+- Passwordless task registration uses `New-ScheduledTaskPrincipal -LogonType
+  ServiceAccount` with no `-User`/`-Password`. Do not pass an empty password or fall back
+  to `CreateProcessWithLogonW`; a passwordless account cannot use it.
 - The scheduled-task path defaults to `-RunLevel Highest` and retries with `Limited` only
   when task registration fails with access denied / privilege-not-held. `-RunLevel Limited`
   skips the Highest attempt. Do not silently downgrade for other errors.
@@ -116,7 +134,9 @@ interactive logged-on session.
   helper uses `IPCNamedPipeServerEnabled`, `IPCNamedPipeServer`, `_serverPipeStream`, and
   the same mediator. A PowerShell upgrade may require updating them; run the suite if
   touching either helper.
-- Target accounts need a password. Passwordless/gMSA/virtual accounts are not supported.
+- Target accounts need a password unless they are one of the three built-in passwordless
+  accounts selected by `-Identity`. gMSA, `NT SERVICE\*`, `NT TASK\*`, and other virtual
+  accounts are still unsupported; do not route them through the `ServiceAccount` task path.
 
 ## Testing traps
 
@@ -134,8 +154,16 @@ interactive logged-on session.
   clean those by hand before rerunning.
 - The suite reads local accounts and registers real scheduled tasks; avoid parallel runs.
 - The scheduled-task test uses the test-only `-InteractiveToken` path. Production uses
-  `-Credential` and a stored-password/batch logon; do not "simplify" the production path
-  to the test path.
+  `-Credential` and a stored-password/batch logon, or `-Identity` and a service-account
+  logon; do not "simplify" either production path to the test path.
+- The built-in service-account tests are tagged `ServiceAccount` and skip themselves when
+  the host is not elevated. They must also exercise a writable target TEMP, because the
+  target compiles its pipe helper with `Add-Type`; a service-account profile/TEMP problem
+  otherwise looks like a pipe-startup failure. Use `tools/Test-BuiltInServiceAccounts.ps1`
+  for the manual elevated check, including a 5.1 target via `-PowerShellPath`.
+- Do not assume `CreateProcessWithLogonW` can start `SYSTEM`, `LOCAL SERVICE`, or
+  `NETWORK SERVICE`. They have no password; the only route is the `ServiceAccount` task
+  principal.
 - The Pester scheduled-task test runs non-elevated, so default `Highest` registration is
   expected to fall back to `Limited`. Do not assert that the registered run level is
   Highest there; test Highest separately from an elevated caller.
